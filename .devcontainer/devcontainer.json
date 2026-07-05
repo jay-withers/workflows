@@ -1,6 +1,4 @@
 {
-  "name": "template-pipelines",
-  "image": "ghcr.io/jay-withers/dev-container/base:latest",
   "customizations": {
     "vscode": {
       "extensions": [
@@ -16,21 +14,23 @@
         "editorconfig.editorconfig"
       ],
       "settings": {
-        "editor.formatOnSave": true,
-        "files.insertFinalNewline": true,
-        "files.trimTrailingWhitespace": true,
-        "[yaml]": {
-          "editor.defaultFormatter": "redhat.vscode-yaml"
-        },
         "[github-actions-workflow]": {
           "editor.defaultFormatter": "redhat.vscode-yaml"
         },
         "[shellscript]": {
           "editor.defaultFormatter": "foxundermoon.shell-format"
-        }
+        },
+        "[yaml]": {
+          "editor.defaultFormatter": "redhat.vscode-yaml"
+        },
+        "editor.formatOnSave": true,
+        "files.insertFinalNewline": true,
+        "files.trimTrailingWhitespace": true
       }
     }
   },
-  "remoteUser": "vscode",
-  "postCreateCommand": "make install"
+  "image": "ghcr.io/jay-withers/dev-container/base:latest",
+  "name": "template-pipelines",
+  "postCreateCommand": "make install",
+  "remoteUser": "vscode"
 }

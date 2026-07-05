@@ -35,20 +35,11 @@ jobs:
       azure-subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 ```
 
-### Setting up Azure OIDC
-
-[`scripts/setup-azure-oidc.sh`](scripts/setup-azure-oidc.sh) bootstraps everything for a calling repository: it creates the app registration and service principal, adds federated credentials (branch, pull requests, and any GitHub environments you pass), assigns a role on the subscription, and sets `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_SUBSCRIPTION_ID` as Actions variables on the repo. Requires `az`, `gh`, and `jq`, logged in with permissions to create app registrations and role assignments.
-
-```sh
-./scripts/setup-azure-oidc.sh -r jay-withers/my-infra -e production
-```
-
 ### Terraform inputs
 
 | Input | Default | Description |
 | --- | --- | --- |
 | `working-directory` | `.` | Directory containing the Terraform code |
-| `terraform-version` | `1.9.8` | Terraform version to install |
 | `apply` | `false` | Run `terraform apply` on the saved plan after a successful plan |
 | `environment` | `""` | GitHub environment for the apply job — set required reviewers on it to gate applies |
 | `azure-client-id` | required | Azure app registration / managed identity client ID for OIDC |
@@ -57,6 +48,7 @@ jobs:
 
 Notes:
 
+- The Terraform version comes from a `.terraform-version` file (the [tfenv](https://github.com/tfutils/tfenv) convention) in the calling repository — looked up in `working-directory` first, then the repo root. Renovate's built-in `terraform-version` manager (part of `config:recommended`) keeps it bumped.
 - The plan job needs `pull-requests: write` (PR comments) and `id-token: write` (OIDC); the caller's `GITHUB_TOKEN` must not restrict these below what the reusable workflow requests.
 - The plan file is uploaded as a short-lived artifact and applied verbatim, so what was reviewed is what gets applied. Plan files can contain sensitive values — keep this repo's callers private if that matters.
 - The Terraform backend is expected to be configured in code (an `azurerm` backend block; `ARM_USE_OIDC=true` is exported so it can use OIDC too).
@@ -119,7 +111,11 @@ Outputs `tag` (e.g. `v1.4.2`) and `version` (`1.4.2`) for downstream jobs.
 
 ## Repo CI
 
-[`lint.yml`](.github/workflows/lint.yml) runs [actionlint](https://github.com/rhysd/actionlint) against the workflows in this repository on every push and pull request.
+This repo dogfoods its own reusable workflows by calling them with local paths (no `@ref` needed):
+
+- [`ci.yml`](.github/workflows/ci.yml) calls [`pre-commit.yml`](.github/workflows/pre-commit.yml) on every push and pull request — the hooks in [`.pre-commit-config.yaml`](.pre-commit-config.yaml) cover actionlint, gitleaks secret scanning and file hygiene.
+- [`cd.yml`](.github/workflows/cd.yml) calls [`release.yml`](.github/workflows/release.yml) on pushes to `main` with `update-major-tag: true`, so callers can pin to `@v1`.
+- Every external action is pinned to a full commit SHA with the version in a trailing comment. A pre-commit hook (`pin-github-actions`) enforces this in CI, and Renovate (`helpers:pinGitHubActionDigests`) keeps the pins up to date.
 
 ## Development
 
@@ -131,7 +127,7 @@ make lint        # actionlint + shellcheck (falls back to docker if not installe
 make pre-commit  # run all pre-commit hooks against the full repo
 ```
 
-The repo dogfoods its own [pre-commit workflow](.github/workflows/pre-commit.yml) config via [`.pre-commit-config.yaml`](.pre-commit-config.yaml).
+The same hooks run in CI via the repo's own [pre-commit workflow](.github/workflows/pre-commit.yml).
 
 ## Versioning
 
