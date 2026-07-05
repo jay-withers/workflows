@@ -54,7 +54,9 @@ jobs:
         if: inputs.update-major-tag && !inputs.dry-run && steps.tag.outputs.new_tag != ''
         run: |
           major="v$(echo "${{ steps.tag.outputs.new_version }}" | cut -d. -f1)"
-          git tag -f "$major" "${{ steps.tag.outputs.new_tag }}"
+          # The tag action creates the new tag on the remote via the API, so it
+          # is not present locally. Point the major tag at the tagged commit.
+          git tag -f "$major" "${{ github.sha }}"
           git push -f origin "$major"
 
       - name: Create GitHub release
