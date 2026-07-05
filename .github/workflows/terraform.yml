@@ -7,10 +7,6 @@ on:
         description: Directory containing the Terraform code
         type: string
         default: "."
-      terraform-version:
-        description: Terraform version to install
-        type: string
-        default: "1.9.8"
       apply:
         description: Whether to run terraform apply after a successful plan
         type: boolean
@@ -45,10 +41,10 @@ jobs:
         working-directory: ${{ inputs.working-directory }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Configure Azure credentials
-        uses: azure/login@v2
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
         with:
           client-id: ${{ inputs.azure-client-id }}
           tenant-id: ${{ inputs.azure-tenant-id }}
@@ -63,10 +59,23 @@ jobs:
             echo "ARM_USE_OIDC=true"
           } >> "$GITHUB_ENV"
 
+      - name: Read Terraform version
+        id: terraform-version
+        run: |
+          if [ -f .terraform-version ]; then
+            file=.terraform-version
+          elif [ -f "$GITHUB_WORKSPACE/.terraform-version" ]; then
+            file="$GITHUB_WORKSPACE/.terraform-version"
+          else
+            echo "::error::No .terraform-version file found in the working directory or the repo root"
+            exit 1
+          fi
+          echo "version=$(cat "$file")" >> "$GITHUB_OUTPUT"
+
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
         with:
-          terraform_version: ${{ inputs.terraform-version }}
+          terraform_version: ${{ steps.terraform-version.outputs.version }}
 
       - name: Terraform Format
         id: fmt
@@ -86,7 +95,7 @@ jobs:
 
       - name: Upload plan
         if: inputs.apply
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: tfplan
           path: ${{ inputs.working-directory }}/tfplan
@@ -94,7 +103,7 @@ jobs:
 
       - name: Comment plan on PR
         if: github.event_name == 'pull_request' && always()
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         env:
           PLAN: ${{ steps.plan.outputs.stdout }}
         with:
@@ -155,10 +164,10 @@ jobs:
         working-directory: ${{ inputs.working-directory }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Configure Azure credentials
-        uses: azure/login@v2
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
         with:
           client-id: ${{ inputs.azure-client-id }}
           tenant-id: ${{ inputs.azure-tenant-id }}
@@ -173,16 +182,29 @@ jobs:
             echo "ARM_USE_OIDC=true"
           } >> "$GITHUB_ENV"
 
+      - name: Read Terraform version
+        id: terraform-version
+        run: |
+          if [ -f .terraform-version ]; then
+            file=.terraform-version
+          elif [ -f "$GITHUB_WORKSPACE/.terraform-version" ]; then
+            file="$GITHUB_WORKSPACE/.terraform-version"
+          else
+            echo "::error::No .terraform-version file found in the working directory or the repo root"
+            exit 1
+          fi
+          echo "version=$(cat "$file")" >> "$GITHUB_OUTPUT"
+
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
         with:
-          terraform_version: ${{ inputs.terraform-version }}
+          terraform_version: ${{ steps.terraform-version.outputs.version }}
 
       - name: Terraform Init
         run: terraform init -input=false
 
       - name: Download plan
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: tfplan
           path: ${{ inputs.working-directory }}
