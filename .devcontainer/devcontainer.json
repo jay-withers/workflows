@@ -1,0 +1,36 @@
+{
+  "name": "template-pipelines",
+  "image": "ghcr.io/jay-withers/dev-container/base:latest",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "anthropic.claude-code",
+        "redhat.vscode-yaml",
+        "github.vscode-github-actions",
+        "github.vscode-pull-request-github",
+        "timonwong.shellcheck",
+        "foxundermoon.shell-format",
+        "davidanson.vscode-markdownlint",
+        "eamodio.gitlens",
+        "mhutchie.git-graph",
+        "editorconfig.editorconfig"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        "files.insertFinalNewline": true,
+        "files.trimTrailingWhitespace": true,
+        "[yaml]": {
+          "editor.defaultFormatter": "redhat.vscode-yaml"
+        },
+        "[github-actions-workflow]": {
+          "editor.defaultFormatter": "redhat.vscode-yaml"
+        },
+        "[shellscript]": {
+          "editor.defaultFormatter": "foxundermoon.shell-format"
+        }
+      }
+    }
+  },
+  "remoteUser": "vscode",
+  "postCreateCommand": "make install"
+}

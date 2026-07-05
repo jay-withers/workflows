@@ -1,0 +1,191 @@
+name: Terraform
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Directory containing the Terraform code
+        type: string
+        default: "."
+      terraform-version:
+        description: Terraform version to install
+        type: string
+        default: "1.9.8"
+      apply:
+        description: Whether to run terraform apply after a successful plan
+        type: boolean
+        default: false
+      environment:
+        description: GitHub environment to use for the apply job (enables approval gates)
+        type: string
+        default: ""
+      azure-client-id:
+        description: Client ID of the Azure app registration / managed identity to authenticate via OIDC
+        type: string
+        required: true
+      azure-tenant-id:
+        description: Azure tenant ID
+        type: string
+        required: true
+      azure-subscription-id:
+        description: Azure subscription ID
+        type: string
+        required: true
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure Azure credentials
+        uses: azure/login@v2
+        with:
+          client-id: ${{ inputs.azure-client-id }}
+          tenant-id: ${{ inputs.azure-tenant-id }}
+          subscription-id: ${{ inputs.azure-subscription-id }}
+
+      - name: Export Azure provider environment
+        run: |
+          {
+            echo "ARM_CLIENT_ID=${{ inputs.azure-client-id }}"
+            echo "ARM_TENANT_ID=${{ inputs.azure-tenant-id }}"
+            echo "ARM_SUBSCRIPTION_ID=${{ inputs.azure-subscription-id }}"
+            echo "ARM_USE_OIDC=true"
+          } >> "$GITHUB_ENV"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+
+      - name: Terraform Format
+        id: fmt
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init
+        id: init
+        run: terraform init -input=false
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -no-color -input=false -out=tfplan
+
+      - name: Upload plan
+        if: inputs.apply
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ inputs.working-directory }}/tfplan
+          retention-days: 1
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        env:
+          PLAN: ${{ steps.plan.outputs.stdout }}
+        with:
+          script: |
+            const marker = '<!-- terraform-plan -->';
+            const plan = process.env.PLAN || 'Plan failed - see workflow logs.';
+            const truncated = plan.length > 60000 ? plan.slice(0, 60000) + '\n... (truncated)' : plan;
+            const body = `${marker}
+            #### Terraform \`${{ inputs.working-directory }}\`
+            | Step | Result |
+            |------|--------|
+            | Format | \`${{ steps.fmt.outcome }}\` |
+            | Init | \`${{ steps.init.outcome }}\` |
+            | Validate | \`${{ steps.validate.outcome }}\` |
+            | Plan | \`${{ steps.plan.outcome }}\` |
+
+            <details><summary>Show plan</summary>
+
+            \`\`\`terraform
+            ${truncated}
+            \`\`\`
+
+            </details>`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+  apply:
+    name: Apply
+    if: inputs.apply
+    needs: plan
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure Azure credentials
+        uses: azure/login@v2
+        with:
+          client-id: ${{ inputs.azure-client-id }}
+          tenant-id: ${{ inputs.azure-tenant-id }}
+          subscription-id: ${{ inputs.azure-subscription-id }}
+
+      - name: Export Azure provider environment
+        run: |
+          {
+            echo "ARM_CLIENT_ID=${{ inputs.azure-client-id }}"
+            echo "ARM_TENANT_ID=${{ inputs.azure-tenant-id }}"
+            echo "ARM_SUBSCRIPTION_ID=${{ inputs.azure-subscription-id }}"
+            echo "ARM_USE_OIDC=true"
+          } >> "$GITHUB_ENV"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Download plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ inputs.working-directory }}
+
+      - name: Terraform Apply
+        run: terraform apply -input=false tfplan
