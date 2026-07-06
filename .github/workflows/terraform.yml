@@ -7,12 +7,10 @@ on:
         description: Directory containing the Terraform code
         type: string
         default: "."
-      apply:
-        description: Whether to run terraform apply after a successful plan
-        type: boolean
-        default: false
       environment:
-        description: GitHub environment to use for the apply job (enables approval gates)
+        description: >-
+          GitHub environment used for the apply job. Configure it with required
+          reviewers to enforce the manual approval gate between plan and apply.
         type: string
         default: ""
       azure-client-id:
@@ -94,12 +92,12 @@ jobs:
         run: terraform plan -no-color -input=false -out=tfplan
 
       - name: Upload plan
-        if: inputs.apply
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: tfplan
           path: ${{ inputs.working-directory }}/tfplan
-          retention-days: 1
+          retention-days: 5
 
       - name: Comment plan on PR
         if: github.event_name == 'pull_request' && always()
@@ -152,7 +150,7 @@ jobs:
 
   apply:
     name: Apply
-    if: inputs.apply
+    if: github.event_name != 'pull_request'
     needs: plan
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
