@@ -1,0 +1,13 @@
+# Internal: this repo's own use of the reusable pre-commit.yml workflow.
+# Not part of the public API — other repos should call pre-commit.yml directly.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  pre-commit:
+    uses: ./.github/workflows/pre-commit.yml

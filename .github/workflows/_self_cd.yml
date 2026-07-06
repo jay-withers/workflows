@@ -1,3 +1,5 @@
+# Internal: this repo's own use of the reusable release.yml workflow.
+# Not part of the public API — other repos should call release.yml directly.
 name: Release
 
 on:
