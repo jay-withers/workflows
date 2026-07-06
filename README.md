@@ -55,7 +55,7 @@ Notes:
 
 ## Pre-commit CI
 
-Runs `pre-commit run --all-files` with the hook environments cached. The calling repository must contain a `.pre-commit-config.yaml`. Hooks that need extra tooling on the runner (e.g. `terraform-docs`, `tflint`) should install it themselves or use dockerised hooks.
+Runs `pre-commit run --all-files` with the hook environments cached. The calling repository must contain a `.pre-commit-config.yaml`.
 
 ```yaml
 name: Pre-commit
@@ -71,11 +71,31 @@ jobs:
     uses: jay-withers/template-pipelines/.github/workflows/pre-commit.yml@main
 ```
 
+### Terraform hooks
+
+Set `terraform: true` to install the toolchain that Terraform pre-commit hooks (`terraform_fmt`, `terraform_tflint`, `terraform_docs`, `checkov`) expect on the runner — Terraform, TFLint (with plugins initialised), terraform-docs, Checkov, and Node.js. The toolchain is opt-in so non-Terraform repos keep a lean Python-only run.
+
+```yaml
+jobs:
+  pre-commit:
+    uses: jay-withers/template-pipelines/.github/workflows/pre-commit.yml@main
+    with:
+      terraform: true
+```
+
+The Terraform version resolves from the `terraform-version` input, falling back to a `.terraform-version` file, then `latest`. `actionlint` and `gitleaks` need no extra install here — they run as pre-commit-managed hook repos from [`.pre-commit-config.yaml`](.pre-commit-config.yaml).
+
 ### Pre-commit inputs
 
 | Input | Default | Description |
 | --- | --- | --- |
 | `python-version` | `3.12` | Python version used to run pre-commit |
+| `terraform` | `false` | Install the Terraform toolchain (Terraform, TFLint, terraform-docs, Checkov, Node) for Terraform hooks |
+| `terraform-version` | `""` | Terraform version to install; if empty, read from `.terraform-version`, falling back to `latest` |
+| `node-version` | `24` | Node.js version to install when `terraform` is enabled |
+| `terraform-docs-version` | `0.24.0` | terraform-docs version to install (without leading `v`) when `terraform` is enabled |
+| `checkov-version` | `3.3.6` | Checkov version to install when `terraform` is enabled |
+| `tflint-config` | `terraform/.tflint.hcl` | Path to the TFLint config used to initialise plugins when `terraform` is enabled |
 
 ## Semver release tagging
 
