@@ -135,7 +135,8 @@ This repo dogfoods its own reusable workflows by calling them with local paths (
 
 - [`_self_ci.yml`](.github/workflows/_self_ci.yml) calls [`pre-commit.yml`](.github/workflows/pre-commit.yml) on every push and pull request — the hooks in [`.pre-commit-config.yaml`](.pre-commit-config.yaml) cover actionlint, gitleaks secret scanning and file hygiene.
 - [`_self_cd.yml`](.github/workflows/_self_cd.yml) calls [`release.yml`](.github/workflows/release.yml) on pushes to `main` with `update-major-tag: true`, so callers can pin to `@v1`.
-- Every external action is pinned to a full commit SHA with the version in a trailing comment. A pre-commit hook (`pin-github-actions`) enforces this in CI, and Renovate (`helpers:pinGitHubActionDigests`) keeps the pins up to date.
+- Every external action is pinned to a full commit SHA with the version in a trailing comment. A pre-commit hook (`pin-github-actions`) enforces this in CI, and Renovate keeps the pins up to date.
+- Dependency updates come from the shared presets in [`template-renovate`](https://github.com/jay-withers/template-renovate); [`renovate.json`](renovate.json) just extends them, so policy changes land centrally.
 
 ## Development
 
