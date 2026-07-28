@@ -1,30 +1,8 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "autoApprove": true,
-  "automerge": true,
-  "automergeStrategy": "squash",
-  "automergeType": "pr",
+  "description": "Uses the shared config from jay-withers/template-renovate. autoApprove lets updates satisfy the branch-protection review requirement so they can auto-merge.",
   "extends": [
-    "config:recommended",
-    "helpers:pinGitHubActionDigests",
-    "schedule:weekly"
-  ],
-  "packageRules": [
-    {
-      "groupName": "GitHub Actions",
-      "matchManagers": [
-        "github-actions"
-      ]
-    },
-    {
-      "groupName": "pre-commit hooks",
-      "matchManagers": [
-        "pre-commit"
-      ]
-    }
-  ],
-  "platformAutomerge": true,
-  "pre-commit": {
-    "enabled": true
-  }
+    "github>jay-withers/template-renovate"
+  ]
 }
