@@ -1,9 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help install lint actionlint shellcheck pre-commit protect-branch
-
-BRANCH ?= main
-CHECKS ?= pre-commit / Pre-commit
+.PHONY: help install lint actionlint shellcheck pre-commit
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -30,6 +27,3 @@ shellcheck: ## Lint shell scripts
 
 pre-commit: ## Run all pre-commit hooks against the full repo
 	pre-commit run --all-files --show-diff-on-failure
-
-protect-branch: ## Configure repo auto-merge + branch protection ruleset via gh (args: BRANCH, CHECKS)
-	./scripts/protect-branch.sh "$(BRANCH)" "$(CHECKS)"
