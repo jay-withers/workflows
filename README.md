@@ -6,6 +6,7 @@ Reusable GitHub Actions workflows, called from other repositories via `workflow_
 | --- | --- |
 | [`terraform.yml`](.github/workflows/terraform.yml) | Terraform CI: credential-free init, validate and optional `terraform test` across one or more root modules |
 | [`pre-commit.yml`](.github/workflows/pre-commit.yml) | Runs all pre-commit hooks against the full repository |
+| [`python.yml`](.github/workflows/python.yml) | Python CI: runs a project's test suite with uv |
 | [`release.yml`](.github/workflows/release.yml) | Semver tagging on CD: bumps from conventional commits, pushes the tag, creates a GitHub release |
 
 ## Terraform CI
@@ -96,6 +97,50 @@ The Terraform version resolves from the `terraform-version` input, falling back 
 | `terraform-docs-version` | `0.24.0` | terraform-docs version to install (without leading `v`) when `terraform` is enabled |
 | `checkov-version` | `3.3.6` | Checkov version to install when `terraform` is enabled |
 | `tflint-config` | `terraform/.tflint.hcl` | Path to the TFLint config used to initialise plugins when `terraform` is enabled |
+
+## Python CI
+
+Runs a project's test suite with [uv](https://docs.astral.sh/uv/), on the Python version you name.
+
+Linting is not testing. A repo calling `pre-commit.yml` gets ruff, which proves the code parses and is formatted — not that it works. The gap is widest where nobody reads the diff: with Renovate's `autoApprove` a dependency bump reaches `main` unattended, so a release that breaks a library boundary merges green unless something runs the suite.
+
+```yaml
+name: ci-python
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    uses: jay-withers/workflows/.github/workflows/python.yml@main
+    with:
+      working-directory: apps/investagent
+      python-version: "3.14"
+      extras: dev
+```
+
+Notes:
+
+- **The required status check is `<caller job id> / Test`** — for the example above, `test / Test`, the same namespacing `pre-commit.yml` and `terraform.yml` carry. Update branch protection when adopting this, or the required check hangs pending forever.
+- **`extras` is the one input that is easy to get wrong.** `uv run` installs dependency *groups* but not *extras*, so a project whose pytest lives in `[project.optional-dependencies]` must name that extra here. Without it the run fails with a bare `error: Failed to spawn: pytest` after a successful-looking install — and it fails only in CI, because locally the extra is already in the developer's `.venv` from whatever `make install` does.
+- **Pin `python-version` to the version the project actually ships on**, not the newest release. A suite that passes on 3.13 says nothing about an image built `FROM python:3.14`.
+- `locked` defaults to true, so a `pyproject.toml` edited without its lockfile fails here rather than being resolved around silently as it would be on a developer's machine.
+- No internal path filter, unlike `terraform.yml`. A Python suite is seconds of runner time where a Terraform matrix is minutes, so filtering buys little — and always running sidesteps the pending-check trap that file documents.
+
+### Python inputs
+
+| Input | Default | Description |
+| --- | --- | --- |
+| `working-directory` | `.` | Directory holding `pyproject.toml` and `uv.lock` |
+| `python-version` | `3.12` | Python version to run the suite on |
+| `extras` | `""` | Space-separated optional-dependency extras to install |
+| `command` | `pytest` | Command to run under `uv run` |
+| `locked` | `true` | Fail if `uv.lock` is out of date with `pyproject.toml` |
+| `runs-on` | `ubuntu-latest` | Runner label |
 
 ## Semver release tagging
 

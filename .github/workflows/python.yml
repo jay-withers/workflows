@@ -1,0 +1,81 @@
+name: Python
+
+# Reusable Python CI: run a project's test suite with uv.
+#
+# Exists because linting is not testing. A repo calling pre-commit.yml gets
+# ruff, which proves the code parses and is formatted — not that it works. The
+# gap is widest where nobody reads the diff: with Renovate's autoApprove a
+# dependency bump reaches main unattended, so a release that breaks a library
+# boundary merges green unless something runs the suite.
+#
+# Deliberately no internal path filter, unlike terraform.yml. A Python suite is
+# seconds of runner time where a Terraform matrix is minutes, so filtering buys
+# little — and always running sidesteps the trap that file documents, where a
+# required check that gets skipped stays pending and blocks the merge.
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Directory holding pyproject.toml and uv.lock
+        type: string
+        default: "."
+      python-version:
+        description: Python version to run the suite on. Match the runtime image rather than the latest release, or a pass here says nothing about what ships
+        type: string
+        default: "3.12"
+      extras:
+        description: >-
+          Space-separated optional-dependency extras to install. `uv run`
+          installs dependency groups but *not* extras, so a project whose
+          pytest sits in [project.optional-dependencies] has to name it here —
+          otherwise the run fails with a bare "Failed to spawn: pytest"
+        type: string
+        default: ""
+      command:
+        description: Command to run under `uv run`
+        type: string
+        default: pytest
+      locked:
+        description: Fail if uv.lock is out of date with pyproject.toml, rather than silently resolving around it as a developer's machine would
+        type: boolean
+        default: true
+      runs-on:
+        description: Runner label
+        type: string
+        default: ubuntu-latest
+
+jobs:
+  test:
+    name: Test
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          python-version: ${{ inputs.python-version }}
+          enable-cache: true
+          cache-dependency-glob: ${{ inputs.working-directory }}/uv.lock
+
+      - name: Run ${{ inputs.command }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          # Through the environment rather than interpolated into the script:
+          # an input expanded directly into `run` is executed by the shell.
+          EXTRAS: ${{ inputs.extras }}
+          LOCKED: ${{ inputs.locked }}
+          COMMAND: ${{ inputs.command }}
+        run: |
+          args=()
+          if [ "$LOCKED" = "true" ]; then
+            args+=(--locked)
+          fi
+          for extra in $EXTRAS; do
+            args+=(--extra "$extra")
+          done
+          read -ra command <<< "$COMMAND"
+          uv run "${args[@]}" "${command[@]}"
