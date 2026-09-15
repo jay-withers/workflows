@@ -122,8 +122,8 @@ jobs:
 
           # Split on any whitespace, so a caller can pass one tag, a
           # space-separated pair, or a YAML block scalar per line. Read from a
-          # stream rather than left unquoted, which would be word splitting
-          # shellcheck is right to flag.
+          # stream rather than left unquoted, which would be exactly the word
+          # splitting SC2086 is right to flag.
           values=()
           while read -r tag; do
             [ -n "$tag" ] || continue
