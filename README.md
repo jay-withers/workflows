@@ -113,6 +113,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: write  # only needed for coverage-pr-comment
 
 jobs:
   test:
@@ -135,6 +136,7 @@ Notes:
 - **`coverage` names the import package, and nothing is gated on the result.** Set it and the table lands in the job summary; add `coverage-pr-comment: true` for a single PR comment kept up to date across pushes. There is no `--cov-fail-under` input on purpose — a threshold set in a shared workflow is a threshold no consuming repo chose, and the cheapest way to meet one is almost always to mock out whatever is uncovered rather than to test it. Coverage that is not gated has to be *seen* instead, which is what the summary and the comment are for.
 - **`pytest-cov` is not a dependency you have to add.** It arrives through `uv run --with`, an ephemeral overlay, so turning coverage on costs a consuming repo no dev extra and no lockfile churn — and `--with` does not invalidate `locked`.
 - **`coverage-pr-comment` needs `pull-requests: write` on the caller**, since a reusable workflow cannot grant itself more than its caller holds. Without it the comment logs a warning and the suite still passes, rather than failing a green run over a comment. The same path covers a fork's read-only token.
+- **Set `permissions` on the caller.** This workflow declares none of its own, precisely so the comment's `pull-requests: write` is reachable — which means a caller that sets nothing passes down the repository default instead of a read-only token. `contents: read` is the whole requirement without the comment; add `pull-requests: write` with it.
 
 ### Python inputs
 

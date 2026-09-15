@@ -65,8 +65,15 @@ jobs:
   test:
     name: Test
     runs-on: ${{ inputs.runs-on }}
-    permissions:
-      contents: read
+    # Deliberately no `permissions` block: the token is whatever the caller
+    # grants. A called workflow can never hold more than its caller, so pinning
+    # `contents: read` here would make coverage-pr-comment's
+    # `pull-requests: write` unobtainable no matter what the caller does — the
+    # comment would 403 on every run and only ever log its warning.
+    #
+    # The cost is that a caller with no `permissions` block of its own passes
+    # down the repository default rather than a read-only token, so callers
+    # should set one. Every example in the README does.
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
