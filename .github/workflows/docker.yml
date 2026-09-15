@@ -124,11 +124,26 @@ jobs:
           # space-separated pair, or a YAML block scalar per line. Read from a
           # stream rather than left unquoted, which would be exactly the word
           # splitting SC2086 is right to flag.
+          #
+          # The '\n' in the printf is load-bearing. `read` returns non-zero on
+          # a final line with no trailing newline, and the loop body does not
+          # run for it — so `printf '%s'` silently dropped a single-tag input
+          # entirely, and published only the SHA tag.
           values=()
           while read -r tag; do
             [ -n "$tag" ] || continue
             values+=("$tag")
-          done < <(printf '%s' "$TAGS" | tr -s '[:space:]' '\n')
+          done < <(printf '%s\n' "$TAGS" | tr -s '[:space:]' '\n')
+
+          # Guards the above rather than only the empty-input case. The
+          # original bug published a usable image under one tag and lost the
+          # other, so "push succeeded" was not evidence the tags were right:
+          # a non-empty `tags` input that yields no values is now an error,
+          # whatever tag-with-sha may have added.
+          if [ -n "${TAGS//[[:space:]]/}" ] && [ ${#values[@]} -eq 0 ]; then
+            echo "::error::tags was non-empty but no tag values parsed out of it: '$TAGS'"
+            exit 1
+          fi
           if [ "$TAG_WITH_SHA" = "true" ]; then
             values+=("$(git rev-parse --short HEAD)")
           fi
