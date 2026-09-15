@@ -39,6 +39,23 @@ on:
         description: Fail if uv.lock is out of date with pyproject.toml, rather than silently resolving around it as a developer's machine would
         type: boolean
         default: true
+      coverage:
+        description: >-
+          Import package to measure coverage of, e.g. "investagent". Empty
+          disables coverage entirely. Reported into the job summary and never
+          gated: a threshold set here would be a threshold no consuming repo
+          chose, and the honest response to one is usually to mock out whatever
+          is uncovered rather than to test it
+        type: string
+        default: ""
+      coverage-pr-comment:
+        description: >-
+          Post the coverage table as a single PR comment, updated in place on
+          every run. Needs `pull-requests: write` on the *caller* — a reusable
+          workflow cannot grant itself more than its caller holds, so without it
+          the comment fails on a 403 while the suite still passes
+        type: boolean
+        default: false
       runs-on:
         description: Runner label
         type: string
@@ -69,6 +86,7 @@ jobs:
           EXTRAS: ${{ inputs.extras }}
           LOCKED: ${{ inputs.locked }}
           COMMAND: ${{ inputs.command }}
+          COVERAGE: ${{ inputs.coverage }}
         run: |
           args=()
           if [ "$LOCKED" = "true" ]; then
@@ -78,4 +96,69 @@ jobs:
             args+=(--extra "$extra")
           done
           read -ra command <<< "$COMMAND"
+          # pytest-cov comes in through --with rather than being expected in the
+          # project's dev extra. It is an ephemeral overlay, so a consuming repo
+          # needs no coverage dependency and no lockfile churn to turn this on,
+          # and --with does not invalidate the --locked assertion above.
+          #
+          # Appended to `command` rather than folded into the `command` input so
+          # the override stays free for its own purpose: a repo passing
+          # `command: pytest -x` must not silently lose its coverage, and one
+          # passing `python -m unittest` must not be handed flags it cannot
+          # parse.
+          if [ -n "$COVERAGE" ]; then
+            args+=(--with pytest-cov)
+            command+=(--cov="$COVERAGE" --cov-report=term-missing)
+          fi
           uv run "${args[@]}" "${command[@]}"
+
+      # always(), because a failing suite is exactly when the reader wants to
+      # know what the tests did reach. Guarded on the data file because a run
+      # that died during collection never wrote one, and `coverage report`
+      # would then fail the job over a report about nothing.
+      - name: Report coverage
+        if: ${{ always() && inputs.coverage != '' }}
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          if [ ! -f .coverage ]; then
+            echo "No coverage data was written — skipping the report." >&2
+            exit 0
+          fi
+          # --format=markdown renders the same table as the terminal report,
+          # which is what makes it usable in both a job summary and a comment.
+          uv run --with pytest-cov coverage report --format=markdown > coverage.md
+          {
+            echo "## Coverage"
+            echo
+            cat coverage.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # A single comment kept up to date, rather than one per push: a PR with
+      # twenty commits should carry one coverage table, not twenty. Matched on
+      # an HTML marker, which survives the body being edited and is invisible in
+      # the rendered comment.
+      - name: Comment coverage on the pull request
+        if: ${{ always() && inputs.coverage != '' && inputs['coverage-pr-comment'] && github.event_name == 'pull_request' }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          [ -f coverage.md ] || exit 0
+          marker='<!-- jay-withers/workflows: coverage -->'
+          printf '%s\n## Coverage\n\n' "$marker" > comment.md
+          cat coverage.md >> comment.md
+          existing=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            --jq "map(select(.body | startswith(\"$marker\")))[0].id // empty")
+          # Never fatal. The token is read-only on a fork's pull request and on
+          # any caller that did not grant pull-requests: write, and a suite that
+          # passed must not be reported as failed because a comment did not
+          # post. The warning is the signal that the permission is missing.
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$existing" -F body=@comment.md >/dev/null \
+              || echo "::warning::Could not update the coverage comment (needs pull-requests: write on the caller)."
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -F body=@comment.md >/dev/null \
+              || echo "::warning::Could not post the coverage comment (needs pull-requests: write on the caller)."
+          fi
