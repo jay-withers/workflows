@@ -121,6 +121,8 @@ jobs:
       working-directory: apps/investagent
       python-version: "3.14"
       extras: dev
+      coverage: investagent
+      coverage-pr-comment: true
 ```
 
 Notes:
@@ -130,6 +132,9 @@ Notes:
 - **Pin `python-version` to the version the project actually ships on**, not the newest release. A suite that passes on 3.13 says nothing about an image built `FROM python:3.14`.
 - `locked` defaults to true, so a `pyproject.toml` edited without its lockfile fails here rather than being resolved around silently as it would be on a developer's machine.
 - No internal path filter, unlike `terraform.yml`. A Python suite is seconds of runner time where a Terraform matrix is minutes, so filtering buys little — and always running sidesteps the pending-check trap that file documents.
+- **`coverage` names the import package, and nothing is gated on the result.** Set it and the table lands in the job summary; add `coverage-pr-comment: true` for a single PR comment kept up to date across pushes. There is no `--cov-fail-under` input on purpose — a threshold set in a shared workflow is a threshold no consuming repo chose, and the cheapest way to meet one is almost always to mock out whatever is uncovered rather than to test it. Coverage that is not gated has to be *seen* instead, which is what the summary and the comment are for.
+- **`pytest-cov` is not a dependency you have to add.** It arrives through `uv run --with`, an ephemeral overlay, so turning coverage on costs a consuming repo no dev extra and no lockfile churn — and `--with` does not invalidate `locked`.
+- **`coverage-pr-comment` needs `pull-requests: write` on the caller**, since a reusable workflow cannot grant itself more than its caller holds. Without it the comment logs a warning and the suite still passes, rather than failing a green run over a comment. The same path covers a fork's read-only token.
 
 ### Python inputs
 
@@ -139,6 +144,8 @@ Notes:
 | `python-version` | `3.12` | Python version to run the suite on |
 | `extras` | `""` | Space-separated optional-dependency extras to install |
 | `command` | `pytest` | Command to run under `uv run` |
+| `coverage` | `""` | Import package to measure coverage of. Empty disables it. Never gated |
+| `coverage-pr-comment` | `false` | Post the coverage table as one self-updating PR comment. Needs `pull-requests: write` on the caller |
 | `locked` | `true` | Fail if `uv.lock` is out of date with `pyproject.toml` |
 | `runs-on` | `ubuntu-latest` | Runner label |
 
