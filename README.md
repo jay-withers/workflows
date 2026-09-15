@@ -7,6 +7,7 @@ Reusable GitHub Actions workflows, called from other repositories via `workflow_
 | [`terraform.yml`](.github/workflows/terraform.yml) | Terraform CI: credential-free init, validate and optional `terraform test` across one or more root modules |
 | [`pre-commit.yml`](.github/workflows/pre-commit.yml) | Runs all pre-commit hooks against the full repository |
 | [`python.yml`](.github/workflows/python.yml) | Python CI: runs a project's test suite with uv |
+| [`docker.yml`](.github/workflows/docker.yml) | Container images: builds one or more images, optionally pushing them under immutable tags |
 | [`release.yml`](.github/workflows/release.yml) | Semver tagging on CD: bumps from conventional commits, pushes the tag, creates a GitHub release |
 
 ## Terraform CI
@@ -51,6 +52,15 @@ Notes:
 - The caller must grant the calling job `pull-requests: read`; the path filter that decides whether the PR touches Terraform runs inside this workflow.
 - Path filtering lives inside this workflow rather than on the caller's trigger, so the workflow always runs and the gate job always reports. A workflow skipped by a top-level paths filter leaves its required check pending and blocks the merge. The filter matches `terraform/**`, `.terraform-version` and `.github/workflows/ci-terraform.yml`.
 - The gate job treats *skipped* as success, so a PR touching no Terraform is not blocked.
+- **The `changed` output exposes the path filter's verdict**, so a caller that keeps a Terraform job this workflow will not run — a credentialled `plan`, typically — can gate it on the same filter rather than declaring a second `dorny/paths-filter` that drifts. The cost is ordering: `needs:` waits for the whole called workflow, so such a job starts after `validate` finishes instead of beside it.
+
+  ```yaml
+    plan:
+      needs: terraform
+      if: always() && needs.terraform.outputs.changed == 'true'
+  ```
+
+  A job gated this way needs its own always-reporting gate before it can be a required check — `<caller job id> / Terraform` covers only what runs *inside* this workflow.
 - The Terraform version comes from a `.terraform-version` file (the [tfenv](https://github.com/tfutils/tfenv) convention) — looked up in each directory first, then the repo root. Renovate's built-in `terraform-version` manager (part of `config:recommended`) keeps it bumped.
 - `fmt`, TFLint and Checkov are not run here — they belong to `pre-commit.yml`.
 
@@ -152,6 +162,73 @@ Notes:
 | `coverage-pr-comment` | `false` | Post the coverage table as one self-updating PR comment. Needs `pull-requests: write` on the caller |
 | `postgres` | `""` | Postgres image tag to run for the suite. Empty runs none. Exports `POSTGRES_TEST_DSN` |
 | `locked` | `true` | Fail if `uv.lock` is out of date with `pyproject.toml` |
+| `runs-on` | `ubuntu-latest` | Runner label |
+
+## Container images
+
+Builds every image a repository ships, and optionally pushes them. A pull request calls this with `push: false`; the release calls it with `push: true` and the tags to publish. Nothing else differs between the two, which is the point — kept as separate workflows, the PR build and the release build drift on platform, context and cache scope until a green PR proves very little about the release.
+
+```yaml
+name: ci-container-build
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - apps/**
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: jay-withers/workflows/.github/workflows/docker.yml@main
+    with:
+      images: |
+        [{"name": "api", "context": "apps/api"},
+         {"name": "dashboard", "context": "apps/dashboard"}]
+```
+
+And the publishing half, from a workflow chained after `release.yml`:
+
+```yaml
+jobs:
+  publish:
+    permissions:
+      contents: read
+      packages: write
+    uses: jay-withers/workflows/.github/workflows/docker.yml@main
+    with:
+      images: '[{"name": "api", "context": "apps/api"}]'
+      ref: ${{ inputs.version }}
+      push: true
+      tags: ${{ inputs.version }}
+      tag-with-sha: true
+```
+
+Notes:
+
+- **`push: true` needs `packages: write` on the caller.** This workflow declares no `permissions` of its own, for the same reason `python.yml` does not: a called workflow can never hold more than its caller, so pinning `contents: read` here would make `packages: write` unobtainable however the caller was configured. Set `permissions` on every calling job.
+- **Set `ref` to the tag you are publishing.** On a `workflow_call`, `github.sha` is the *calling branch's* head rather than the tag, so a release that trusted it would publish the branch under the tag's name. `tag-with-sha` then resolves the short SHA from the checkout, which is the commit that was actually built.
+- **No tag is ever `latest`, and none is moved.** Azure Container Apps creates a revision only when the template changes, so re-pushing a moving tag deploys nothing and reports success. Push `vX.Y.Z` and the short SHA, both immutable, and let the deploy pin one.
+- **`push` must stay false on a pull request.** A fork's `GITHUB_TOKEN` could not push anyway, and a PR that publishes an image is a supply-chain hole. The cache is shared by image name across both calls, so a release usually reuses the layers its own PR built.
+- A push with no tags fails the job rather than building and publishing nothing usable. A build that is not pushing needs no tags at all.
+- **First push to a GHCR package needs two things `packages: write` cannot supply.** A new package is private whatever the repository's visibility, so make it public once if anything pulls anonymously; and `GITHUB_TOKEN` can only write to a package *linked* to the repository. A package first pushed by hand is user-scoped and unlinked, and the push fails `denied: permission_denied: write_package` — which reads like a missing permission rather than a missing link. The `org.opencontainers.image.source` label establishes the link, but only from a push that is already allowed, so either push once by hand with the label in place or grant the repository Write under the package's "Manage Actions access".
+- `platforms` is one platform by default. A manifest list with a single entry buys nothing, and a runtime that only ever runs amd64 pays for every other architecture in build minutes.
+
+### Docker inputs
+
+| Input | Default | Description |
+| --- | --- | --- |
+| `images` | *required* | JSON array of `{"name", "context"}` objects. `name` is the last segment of the reference and the cache scope; `context` is the build context. One matrix leg each |
+| `ref` | `""` | Git ref to check out. Empty uses the event default. Set to the tag on a release |
+| `push` | `false` | Push the images. Keep false on pull requests |
+| `tags` | `""` | Whitespace- or newline-separated tag *values* (not full references) applied to every image. Required when pushing |
+| `tag-with-sha` | `false` | Also tag with the short SHA of the checked-out commit |
+| `registry` | `ghcr.io` | Registry host |
+| `image-prefix` | `""` | Path under the registry each name hangs off. Empty uses `owner/repo` |
+| `platforms` | `linux/amd64` | Buildx target platforms |
+| `summary-note` | `""` | Markdown line appended to the job summary after the pushed references |
 | `runs-on` | `ubuntu-latest` | Runner label |
 
 ## Semver release tagging

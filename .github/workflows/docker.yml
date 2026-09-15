@@ -1,0 +1,205 @@
+name: Docker
+
+# Reusable container image CI/CD: builds one or more images from the calling
+# repository and optionally pushes them.
+#
+# One workflow rather than a build one and a publish one, because they are the
+# same job with `push` flipped. Keeping them separate meant the pull request
+# build and the release build drifted — different contexts, different
+# platforms, different cache scopes — so a green PR proved less about the
+# release than it appeared to. Here a PR calls this with `push: false` and the
+# release calls it with `push: true`, and nothing else differs.
+#
+# Nothing is tagged `latest` and no tag is ever moved, deliberately. Azure
+# Container Apps creates a revision only when the template changes, so
+# re-pushing a moving tag deploys nothing and reports success — the one failure
+# mode a release pipeline must not have.
+
+on:
+  workflow_call:
+    inputs:
+      images:
+        description: >-
+          JSON array of objects naming each image to build:
+          `[{"name": "api", "context": "apps/api"}]`. `name` is the last
+          segment of the image reference and the cache scope; `context` is the
+          build context relative to the repository root. One matrix leg each.
+        required: true
+        type: string
+      ref:
+        description: >-
+          Git ref to check out. Empty checks out the default for the event.
+          Set this to the tag being released: on a `workflow_call` `github.sha`
+          is the *calling branch's* head, not the tag, so a release that
+          trusted it would publish the branch under the tag's name.
+        type: string
+        default: ""
+      push:
+        description: >-
+          Push the images. Must stay false on a pull request — a fork's
+          GITHUB_TOKEN could not push anyway, and a PR that publishes an image
+          is a supply-chain hole.
+        type: boolean
+        default: false
+      tags:
+        description: >-
+          Whitespace- or newline-separated tag values (not full references) to
+          apply to every image, e.g. "v1.2.3". Required when pushing.
+        type: string
+        default: ""
+      tag-with-sha:
+        description: >-
+          Also tag each image with the short SHA of the checked-out commit.
+          This is the tag a deploy pins and a run record stores, so it has to
+          name the commit that was actually built.
+        type: boolean
+        default: false
+      registry:
+        description: Registry host.
+        type: string
+        default: ghcr.io
+      image-prefix:
+        description: >-
+          Path under the registry that each image name hangs off. Empty uses
+          `owner/repo`, which is what GHCR links to this repository.
+        type: string
+        default: ""
+      platforms:
+        description: >-
+          Buildx target platforms. One platform by default: a manifest list
+          with a single entry buys nothing, and a runtime that only ever runs
+          amd64 pays for every other architecture in build minutes.
+        type: string
+        default: linux/amd64
+      summary-note:
+        description: >-
+          Line appended to the job summary after the pushed references, for
+          whatever the reader does next (a deploy command, say). Markdown.
+        type: string
+        default: ""
+      runs-on:
+        description: Runner label.
+        type: string
+        default: ubuntu-latest
+
+jobs:
+  build:
+    name: Build ${{ matrix.image.name }}
+    runs-on: ${{ inputs.runs-on }}
+    strategy:
+      # Off so every image reports independently: the first broken Dockerfile
+      # must not hide whether the others are broken too.
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(inputs.images) }}
+    # No `permissions` block, for the reason python.yml documents: a called
+    # workflow can never hold more than its caller, so pinning `contents: read`
+    # here would make `packages: write` unobtainable however the caller is
+    # configured, and every push would fail on a permission the caller had
+    # actually granted. Callers must set their own — the README's examples do.
+    steps:
+      - name: Checkout ${{ inputs.ref }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+
+      # Resolved here rather than interpolated into `tags:` directly, so the
+      # inputs reach the shell through the environment and a tag value cannot
+      # execute anything.
+      - name: Resolve image references
+        id: refs
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          IMAGE_PREFIX: ${{ inputs.image-prefix }}
+          REPOSITORY: ${{ github.repository }}
+          NAME: ${{ matrix.image.name }}
+          TAGS: ${{ inputs.tags }}
+          TAG_WITH_SHA: ${{ inputs.tag-with-sha }}
+          PUSH: ${{ inputs.push }}
+        run: |
+          prefix="${IMAGE_PREFIX:-$REPOSITORY}"
+          image="$REGISTRY/$prefix/$NAME"
+
+          # Split on any whitespace, so a caller can pass one tag, a
+          # space-separated pair, or a YAML block scalar per line. Read from a
+          # stream rather than left unquoted, which would be exactly the word
+          # splitting SC2086 is right to flag.
+          values=()
+          while read -r tag; do
+            [ -n "$tag" ] || continue
+            values+=("$tag")
+          done < <(printf '%s' "$TAGS" | tr -s '[:space:]' '\n')
+          if [ "$TAG_WITH_SHA" = "true" ]; then
+            values+=("$(git rev-parse --short HEAD)")
+          fi
+
+          # A push with no tags would succeed at the build and silently
+          # publish nothing usable, so fail here instead. A build that is not
+          # pushing needs no tag at all.
+          if [ "$PUSH" = "true" ] && [ ${#values[@]} -eq 0 ]; then
+            echo "::error::push is true but no tags were resolved — pass tags and/or tag-with-sha."
+            exit 1
+          fi
+
+          {
+            echo "tags<<EOF"
+            for value in "${values[@]}"; do
+              echo "$image:$value"
+            done
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.0.0
+
+      - name: Log in to ${{ inputs.registry }}
+        if: inputs.push
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.0.0
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The cache is keyed by image name and shared between a pushing and a
+      # non-pushing call, so a release usually reuses the layers its pull
+      # request already built.
+      #
+      # Two GHCR things `packages: write` cannot supply, for a first push:
+      # a new package is private whatever the repository's visibility, so it
+      # has to be made public once if anything pulls anonymously; and
+      # GITHUB_TOKEN can only write to a package *linked* to this repository.
+      # A package first pushed by hand is user-scoped and unlinked, and this
+      # step then fails `denied: permission_denied: write_package`, which reads
+      # like a missing permission rather than a missing link. The
+      # `org.opencontainers.image.source` label establishes the link, but only
+      # from a push that is already allowed — so either push once by hand with
+      # the label in place, or grant the repository Write under the package's
+      # "Manage Actions access".
+      - name: Build ${{ matrix.image.name }} for ${{ inputs.platforms }}
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.0.0
+        with:
+          context: ${{ matrix.image.context }}
+          platforms: ${{ inputs.platforms }}
+          push: ${{ inputs.push }}
+          tags: ${{ steps.refs.outputs.tags }}
+          cache-from: type=gha,scope=${{ matrix.image.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}
+
+      - name: Summarise
+        if: inputs.push
+        env:
+          NAME: ${{ matrix.image.name }}
+          REFS: ${{ steps.refs.outputs.tags }}
+          NOTE: ${{ inputs.summary-note }}
+        run: |
+          {
+            echo "### $NAME"
+            echo
+            echo '```'
+            echo "$REFS"
+            echo '```'
+            if [ -n "$NOTE" ]; then
+              echo
+              echo "$NOTE"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

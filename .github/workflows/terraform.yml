@@ -31,6 +31,15 @@ on:
         description: Runner label for every job.
         type: string
         default: ubuntu-latest
+    outputs:
+      changed:
+        description: >-
+          "true" when the event touched Terraform, straight from the path
+          filter below. Exposed so a caller that keeps a Terraform job of its
+          own — a credentialled plan, which this workflow deliberately does not
+          run — can gate it on the same filter instead of declaring a second
+          copy that then drifts from this one.
+        value: ${{ jobs.changes.outputs.terraform }}
 
 jobs:
   # Path filtering lives here rather than on the caller's workflow trigger so
