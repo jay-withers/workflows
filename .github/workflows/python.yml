@@ -56,6 +56,15 @@ on:
           the comment fails on a 403 while the suite still passes
         type: boolean
         default: false
+      postgres:
+        description: >-
+          Postgres image tag to run for the suite, e.g. "18-alpine". Empty runs
+          none. When set, the server is reachable at localhost:5432 and its DSN
+          is exported as POSTGRES_TEST_DSN — a test that needs a database
+          should skip when that variable is absent, so the suite still runs on
+          a clone with no Docker
+        type: string
+        default: ""
       runs-on:
         description: Runner label
         type: string
@@ -84,6 +93,33 @@ jobs:
           python-version: ${{ inputs.python-version }}
           enable-cache: true
           cache-dependency-glob: ${{ inputs.working-directory }}/uv.lock
+
+      # `docker run` rather than a `services:` block, which cannot be made
+      # conditional: a service with an empty image is a workflow error, so
+      # declaring one unconditionally would impose Postgres on every caller.
+      # A step, unlike a service, can simply be skipped.
+      - name: Start Postgres
+        if: ${{ inputs.postgres != '' }}
+        env:
+          IMAGE: postgres:${{ inputs.postgres }}
+        run: |
+          docker run -d --name ci-postgres \
+            -e POSTGRES_PASSWORD=postgres \
+            -p 5432:5432 "$IMAGE"
+          # Poll rather than trust a fixed sleep: initdb's duration varies with
+          # the runner, and a suite that connects too early fails in a way that
+          # reads like a broken test.
+          for _ in $(seq 1 60); do
+            if docker exec ci-postgres pg_isready -U postgres -q; then
+              echo "POSTGRES_TEST_DSN=postgresql://postgres:postgres@localhost:5432/postgres" \
+                >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::Postgres did not become ready within 60s"
+          docker logs ci-postgres >&2
+          exit 1
 
       - name: Run ${{ inputs.command }}
         working-directory: ${{ inputs.working-directory }}
