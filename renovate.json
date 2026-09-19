@@ -1,8 +1,8 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "autoApprove": true,
-  "description": "Uses the shared config from jay-withers/template-renovate. autoApprove lets updates satisfy the branch-protection review requirement so they can auto-merge.",
+  "description": "Uses the shared config from jay-withers/renovate. autoApprove lets updates satisfy the branch-protection review requirement so they can auto-merge.",
   "extends": [
-    "github>jay-withers/template-renovate"
+    "github>jay-withers/renovate"
   ]
 }
