@@ -29,7 +29,7 @@
       }
     }
   },
-  "image": "ghcr.io/jay-withers/dev-containers/base:latest@sha256:1eb29862705efeebfa5dba26eec427836941580f374ec1168a4867f35c67476a",
+  "image": "ghcr.io/jay-withers/dev-containers/base:latest@sha256:6e8e67a650c76345510ee6ac96b92b4f2f9188e835ae1c62f645419ae8428caf",
   "name": "template-pipelines",
   "postCreateCommand": "make install",
   "remoteUser": "vscode"
