@@ -9,6 +9,7 @@ Reusable GitHub Actions workflows, called from other repositories via `workflow_
 | [`python.yml`](.github/workflows/python.yml) | Python CI: runs a project's test suite with uv |
 | [`docker.yml`](.github/workflows/docker.yml) | Container images: builds one or more images, optionally pushing them under immutable tags |
 | [`release.yml`](.github/workflows/release.yml) | Semver tagging on CD: bumps from conventional commits, pushes the tag, creates a GitHub release |
+| [`codeql.yml`](.github/workflows/codeql.yml) | Code scanning: CodeQL static analysis, one job per language, results in the Security tab |
 
 ## Terraform CI
 
@@ -263,11 +264,61 @@ Typically chained after the Terraform apply job with `needs:`, so a release is o
 
 Outputs `tag` (e.g. `v1.4.2`) and `version` (`1.4.2`) for downstream jobs.
 
+## Code scanning
+
+Runs [CodeQL](https://codeql.github.com/) over the repository, one job per language, and uploads the results to the repository's **Security → Code scanning** tab and as pull request annotations.
+
+Static analysis complements DAST rather than replacing it. A DAST scanner can only attack what is reachable from outside — for an app behind a login, the login form. CodeQL reads every code path, including everything behind the login, and traces untrusted input to where it is used, which is where injection and path-traversal bugs are.
+
+```yaml
+name: ci-codeql
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  codeql:
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    uses: jay-withers/workflows/.github/workflows/codeql.yml@<sha> # vX.Y.Z
+    with:
+      languages: '["python", "actions"]'
+```
+
+Notes:
+
+- **Trigger on `push` to `main` as well as pull requests.** Code scanning compares a pull request's results against the default branch's, so a repo that only ever analyses pull requests has no baseline: every alert looks new, and fixed ones are never closed.
+- **The weekly `schedule` catches old code with new queries.** CodeQL's query packs grow with each release, and an unchanged repo would otherwise never be re-checked against them.
+- **`security-events: write` is required on the caller** to upload results. This workflow declares no permissions of its own, as `python.yml` doesn't, so the caller's grant is the whole token. `actions: read` lets CodeQL read workflow run metadata, which it uses to annotate results.
+- **The job is green whatever it finds.** Findings are alerts in the Security tab, not a failed check. To block merges on new alerts, turn on code scanning merge protection in the repository's ruleset. That's a per-repository decision, not one this workflow makes.
+- **The status checks are `<caller job id> / Analyze (<language>)`**, one per language: for the example above, `codeql / Analyze (python)` and `codeql / Analyze (actions)`.
+- **`actions` is a language too.** It analyses the repository's own workflow files for injection through `${{ }}` expressions, untrusted checkouts in `pull_request_target`, and over-broad tokens. That's worth including in any repo with workflows, which is every repo here.
+- Only languages that need no build are supported as-is (`python`, `actions`, `javascript-typescript`, `ruby`). A compiled language would need a `build-mode` input.
+
+### CodeQL inputs
+
+| Input | Default | Description |
+| --- | --- | --- |
+| `languages` | `'["python", "actions"]'` | JSON array of CodeQL languages, one job each |
+| `queries` | `security-extended` | Query suite: `security-extended` or `security-and-quality` |
+| `runs-on` | `ubuntu-latest` | Runner label |
+
 ## Repo CI
 
 This repo dogfoods its own reusable workflows by calling them with local paths (no `@ref` needed). These callers are prefixed `_self_` to distinguish them from the public reusable workflows — they are internal and not meant to be consumed by other repos:
 
 - [`_self_ci.yml`](.github/workflows/_self_ci.yml) calls [`pre-commit.yml`](.github/workflows/pre-commit.yml) on every push and pull request — the hooks in [`.pre-commit-config.yaml`](.pre-commit-config.yaml) cover actionlint, gitleaks secret scanning and file hygiene.
+- [`_self_codeql.yml`](.github/workflows/_self_codeql.yml) calls [`codeql.yml`](.github/workflows/codeql.yml) with `languages: '["actions"]'`, scanning this repo's own workflow files, which are the only code here.
 - [`_self_cd.yml`](.github/workflows/_self_cd.yml) calls [`release.yml`](.github/workflows/release.yml) on pushes to `main` with `update-major-tag: true`, so callers can pin to `@v1`.
 - Every external action is pinned to a full commit SHA with the version in a trailing comment. A pre-commit hook (`pin-github-actions`) enforces this in CI, and Renovate keeps the pins up to date.
 - Dependency updates come from the shared presets in [`renovate`](https://github.com/jay-withers/renovate); [`renovate.json`](renovate.json) just extends them, so policy changes land centrally.
