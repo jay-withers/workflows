@@ -1,0 +1,22 @@
+# Internal: this repo's own use of the reusable codeql.yml workflow, scanning
+# its workflow files — the only code here. Not part of the public API.
+name: CodeQL
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  codeql:
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    uses: ./.github/workflows/codeql.yml
+    with:
+      languages: '["actions"]'

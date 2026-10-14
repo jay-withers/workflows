@@ -1,0 +1,68 @@
+name: CodeQL
+
+# Reusable CodeQL code scanning: static analysis that traces untrusted input
+# through the code to where it is used — the injection, path-traversal and
+# deserialisation bugs a linter cannot see because they span functions.
+#
+# Exists because the DAST scanner in jay-withers/security-testing can only
+# attack what is reachable without logging in, which for most apps here is a
+# login form. CodeQL reads every code path, including everything behind the
+# login, on every pull request.
+#
+# Results land in the repository's Security tab (code scanning alerts) and as
+# annotations on the pull request, not as a pass/fail of this job: an analysis
+# that ran is green whatever it found. Whether a new alert should block a merge
+# is a ruleset decision (code scanning merge protection), made per repository.
+on:
+  workflow_call:
+    inputs:
+      languages:
+        description: >-
+          JSON array of CodeQL languages to analyse, one job each, e.g.
+          '["python", "actions"]'. Both of those need no build, which is why no
+          build-mode input exists — add one alongside a compiled language
+        type: string
+        default: '["python", "actions"]'
+      queries:
+        description: >-
+          Query suite: `security-extended` (default) adds lower-precision
+          security queries to CodeQL's own default set; `security-and-quality`
+          adds maintainability queries on top. The default suite alone misses
+          enough real findings in small codebases that it is not the default here
+        type: string
+        default: security-extended
+      runs-on:
+        description: Runner label
+        type: string
+        default: ubuntu-latest
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ${{ inputs.runs-on }}
+    # Deliberately no `permissions` block, as in python.yml: a called workflow
+    # can never hold more than its caller, so the caller grants
+    # `security-events: write` (to upload results), `contents: read` and
+    # `actions: read`. Without security-events: write the upload fails on a 403.
+    strategy:
+      # One language failing to analyse must not hide another's results.
+      fail-fast: false
+      matrix:
+        language: ${{ fromJSON(inputs.languages) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Initialise CodeQL
+        uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          queries: ${{ inputs.queries }}
+
+      # The category keeps each language's results separate in code scanning,
+      # so a later run for one language does not close the other's alerts.
+      - name: Analyse
+        uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          category: /language:${{ matrix.language }}
