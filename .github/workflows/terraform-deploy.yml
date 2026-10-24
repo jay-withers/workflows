@@ -108,10 +108,12 @@ jobs:
 
       - name: Check Azure settings
         working-directory: .
+        env:
+          INPUT_ENVIRONMENT: ${{ inputs.environment }}
         run: |
           for v in ARM_CLIENT_ID ARM_TENANT_ID ARM_SUBSCRIPTION_ID; do
             if [ -z "${!v}" ]; then
-              echo "::error::$v is empty. Set AZURE_${v#ARM_} as a variable on the '${{ inputs.environment }}' environment, or pass the matching input."
+              echo "::error::$v is empty. Set AZURE_${v#ARM_} as a variable on the '$INPUT_ENVIRONMENT' environment, or pass the matching input."
               exit 1
             fi
           done
