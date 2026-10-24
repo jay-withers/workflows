@@ -1,0 +1,211 @@
+name: Terraform deploy
+
+# Credentialled plan, and optionally apply, of one root module against one
+# environment, authenticating to Azure with GitHub OIDC.
+#
+# One workflow rather than a plan one and an apply one, for the same reason as
+# docker.yml: a PR calls this with `apply: false` and main calls it with
+# `apply: true`, and nothing else differs, so a green plan on the PR proves the
+# same init and plan the merge will run.
+#
+# Apply runs the saved plan from the same job, never a fresh plan, so what is
+# applied is exactly what was printed above it. It is skipped when the plan has
+# no changes.
+#
+# This is deliberately separate from terraform.yml, which stays credential-free:
+# a plan needs an identity with read on everything the configuration touches
+# and only succeeds once its dependencies exist, so only repos that meet both
+# call this.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: >-
+          Environment name. Picks `backends/<environment>.hcl` and
+          `environments/<environment>.tfvars` inside `directory`, and names the
+          concurrency group.
+        type: string
+        default: dev
+      directory:
+        description: Root-module directory, relative to the repository root.
+        type: string
+        default: terraform
+      apply:
+        description: >-
+          Apply the saved plan when it has changes. Refused on a pull_request
+          event — a PR must never change real infrastructure.
+        type: boolean
+        default: false
+      client-id:
+        description: >-
+          Client ID of the Azure identity federated to this repo, usually
+          `vars.AZURE_CLIENT_ID`. Its federated credential must trust the
+          calling event's subject (`pull_request`, or `ref:refs/heads/main`).
+        type: string
+        required: true
+      tenant-id:
+        description: Entra tenant ID, usually `vars.AZURE_TENANT_ID`.
+        type: string
+        required: true
+      subscription-id:
+        description: Azure subscription ID, usually `vars.AZURE_SUBSCRIPTION_ID`.
+        type: string
+        required: true
+      runs-on:
+        description: Runner label.
+        type: string
+        default: ubuntu-latest
+    outputs:
+      has-changes:
+        description: '"true" when the plan had changes.'
+        value: ${{ jobs.deploy.outputs.has-changes }}
+
+jobs:
+  deploy:
+    name: ${{ inputs.apply && 'Apply' || 'Plan' }} (${{ inputs.environment }})
+    runs-on: ${{ inputs.runs-on }}
+    # No permissions block, deliberately: the job inherits the caller's grant.
+    # A PR caller grants `pull-requests: write` for the plan comment and an
+    # apply caller doesn't, and a job that *requested* it here would refuse to
+    # start for any caller that didn't grant it.
+    #
+    # Applies share one group per directory and environment; a newer pending
+    # apply replacing an older one is fine, since the newer commit on main
+    # contains the older one. Plans are grouped by ref, so a push to one PR
+    # can't replace another PR's pending plan, or a pending apply. Overlapping
+    # plans and applies wait on the state lock instead.
+    # Never cancel in progress: killing an apply mid-run leaves state locked.
+    concurrency:
+      group: terraform-deploy-${{ github.repository }}-${{ inputs.directory }}-${{ inputs.environment }}-${{ inputs.apply && 'apply' || github.ref }}
+      cancel-in-progress: false
+    outputs:
+      has-changes: ${{ steps.plan.outputs.has-changes }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.directory }}
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_CLIENT_ID: ${{ inputs.client-id }}
+      ARM_TENANT_ID: ${{ inputs.tenant-id }}
+      ARM_SUBSCRIPTION_ID: ${{ inputs.subscription-id }}
+      TF_IN_AUTOMATION: "true"
+    steps:
+      - name: Refuse to apply from a pull request
+        if: inputs.apply && github.event_name == 'pull_request'
+        working-directory: .
+        run: |
+          echo "::error::apply: true is not allowed on a pull_request event."
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve Terraform version
+        id: tfversion
+        env:
+          INPUT_DIRECTORY: ${{ inputs.directory }}
+        run: |
+          if [ -f .terraform-version ]; then
+            file=.terraform-version
+          elif [ -f "$GITHUB_WORKSPACE/.terraform-version" ]; then
+            file="$GITHUB_WORKSPACE/.terraform-version"
+          else
+            echo "::error::No .terraform-version file found in $INPUT_DIRECTORY or the repo root"
+            exit 1
+          fi
+          echo "version=$(cat "$file")" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ steps.tfversion.outputs.version }}
+          terraform_wrapper: false
+
+      - name: Terraform init
+        env:
+          TF_ENVIRONMENT: ${{ inputs.environment }}
+        run: terraform init -input=false -backend-config="backends/${TF_ENVIRONMENT}.hcl"
+
+      # -detailed-exitcode: 0 is no changes, 2 is changes, 1 is an error. The
+      # lock timeout covers a PR plan overlapping an apply on main.
+      - name: Terraform plan
+        id: plan
+        env:
+          TF_ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set +e
+          terraform plan -input=false -no-color -lock-timeout=5m \
+            -var-file="environments/${TF_ENVIRONMENT}.tfvars" \
+            -out=tfplan -detailed-exitcode
+          code=$?
+          set -e
+          case "$code" in
+            0) echo "has-changes=false" >> "$GITHUB_OUTPUT" ;;
+            2) echo "has-changes=true" >> "$GITHUB_OUTPUT" ;;
+            *) exit "$code" ;;
+          esac
+
+      # One rendering for both the job summary and the PR comment. 60,000
+      # bytes keeps the comment under GitHub's 65,536-character limit with
+      # room for the wrapper; the full plan is always in the job log above.
+      - name: Render plan
+        id: render
+        env:
+          HAS_CHANGES: ${{ steps.plan.outputs.has-changes }}
+          TITLE: "Terraform plan: `${{ inputs.directory }}` (${{ inputs.environment }})"
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # On a PR, github.sha is the merge commit, which isn't on the branch.
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          body="$RUNNER_TEMP/plan.md"
+          {
+            echo "### $TITLE"
+            echo
+            if [ "$HAS_CHANGES" = "true" ]; then
+              terraform show -no-color tfplan > "$RUNNER_TEMP/plan.txt"
+              grep -E '^Plan:|^Changes to Outputs:' "$RUNNER_TEMP/plan.txt" | head -1 | sed 's/^/**/; s/$/**/'
+              echo
+              echo '<details><summary>Show plan</summary>'
+              echo
+              echo '```hcl'
+              head -c 60000 "$RUNNER_TEMP/plan.txt"
+              if [ "$(wc -c < "$RUNNER_TEMP/plan.txt")" -gt 60000 ]; then
+                echo
+                echo "... truncated, see the run for the full plan"
+              fi
+              echo '```'
+              echo '</details>'
+            else
+              echo "**No changes.** Infrastructure matches the configuration."
+            fi
+            echo
+            echo "[Run]($RUN_URL) · \`${SHA:0:7}\`"
+          } > "$body"
+          cat "$body" >> "$GITHUB_STEP_SUMMARY"
+          echo "body=$body" >> "$GITHUB_OUTPUT"
+
+      # One comment per directory and environment, edited in place on every
+      # push, found by the hidden marker on its first line. Needs the caller
+      # to grant `pull-requests: write`.
+      - name: Comment plan on the PR
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BODY_FILE: ${{ steps.render.outputs.body }}
+          MARKER: "<!-- terraform-deploy:${{ inputs.directory }}:${{ inputs.environment }} -->"
+          REPOSITORY: ${{ github.repository }}
+          COMMENTS_URL: repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments
+        run: |
+          body="$(printf '%s\n%s' "$MARKER" "$(cat "$BODY_FILE")")"
+          id="$(gh api --paginate "$COMMENTS_URL" \
+            --jq "[.[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$MARKER\")))][0].id // empty" | head -1)"
+          if [ -n "$id" ]; then
+            gh api --method PATCH "repos/$REPOSITORY/issues/comments/$id" -f body="$body" > /dev/null
+          else
+            gh api --method POST "$COMMENTS_URL" -f body="$body" > /dev/null
+          fi
+
+      - name: Terraform apply
+        if: inputs.apply && steps.plan.outputs.has-changes == 'true'
+        run: terraform apply -input=false -no-color tfplan
