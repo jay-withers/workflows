@@ -103,13 +103,15 @@ jobs:
 
       - name: Resolve Terraform version
         id: tfversion
+        env:
+          INPUT_DIRECTORY: ${{ inputs.directory }}
         run: |
           if [ -f .terraform-version ]; then
             file=.terraform-version
           elif [ -f "$GITHUB_WORKSPACE/.terraform-version" ]; then
             file="$GITHUB_WORKSPACE/.terraform-version"
           else
-            echo "::error::No .terraform-version file found in ${{ inputs.directory }} or the repo root"
+            echo "::error::No .terraform-version file found in $INPUT_DIRECTORY or the repo root"
             exit 1
           fi
           echo "version=$(cat "$file")" >> "$GITHUB_OUTPUT"
