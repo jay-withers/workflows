@@ -77,11 +77,31 @@ jobs:
       TF_IN_AUTOMATION: "true"
       TF_INPUT: "0"
     steps:
-      - name: Refuse to deploy from a pull request
-        if: github.event_name == 'pull_request'
+      - name: Validate trusted deploy context and version ref
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF_VALUE: ${{ github.ref }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          echo "::error::Deploying is not allowed on a pull_request event."
-          exit 1
+          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "pull_request_target" ]; then
+            echo "::error::Deploying is not allowed from pull request events."
+            exit 1
+          fi
+
+          # Only allow deploying explicit tags (refs/tags/*) or release-like tags (vX.Y.Z...).
+          case "$INPUT_VERSION" in
+            refs/tags/*) ;;
+            v[0-9]*)
+              if ! printf '%s' "$INPUT_VERSION" | grep -Eq '^v[0-9]+(\.[0-9]+){1,2}([.-][0-9A-Za-z._-]+)?$'; then
+                echo "::error::inputs.version must be a valid release tag."
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::inputs.version must be a tag ref (refs/tags/*) or release tag (v*)."
+              exit 1
+              ;;
+          esac
 
       - name: Check Azure settings
         env:
