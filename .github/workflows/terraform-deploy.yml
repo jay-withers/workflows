@@ -59,6 +59,13 @@ on:
         description: Overrides the environment's AZURE_SUBSCRIPTION_ID variable.
         type: string
         default: ""
+      destroy-label:
+        description: >-
+          PR label that accepts a plan which deletes or replaces resources. On a
+          pull request, such a plan fails the job unless the PR carries this
+          label, so nothing auto-merges a destroy unreviewed.
+        type: string
+        default: allow-destroy
       runs-on:
         description: Runner label.
         type: string
@@ -166,6 +173,44 @@ jobs:
             *) exit "$code" ;;
           esac
 
+      # A plan that deletes or replaces anything is a decision, not a routine
+      # change: a provider major can force-replace a Key Vault or a storage
+      # account, and Renovate auto-merges majors once checks are green. So on
+      # a pull request, any `delete` action (a replace is delete + create)
+      # fails the job unless the PR carries `destroy-label`. Labels are read
+      # from the API rather than the event payload, because "Re-run failed
+      # jobs" replays the original payload, from before the label was added.
+      # On main the plan has already been reviewed, so destroys are listed but
+      # never block the apply.
+      - name: Check for destroys
+        id: destroys
+        if: steps.plan.outputs.has-changes == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          DESTROY_LABEL: ${{ inputs.destroy-label }}
+        run: |
+          list="$RUNNER_TEMP/destroys.txt"
+          terraform show -json tfplan \
+            | jq -r '.resource_changes[]? | select(.change.actions | index("delete"))
+                     | "\(.address) (\(if (.change.actions | index("create")) then "replace" else "delete" end))"' \
+            > "$list"
+          count="$(wc -l < "$list" | tr -d ' ')"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+          [ "$count" -gt 0 ] || exit 0
+
+          while read -r line; do echo "::warning::Plan deletes $line"; done < "$list"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            if gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" --jq '.labels[].name' | grep -qxF "$DESTROY_LABEL"; then
+              echo "allowed=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "blocked=true" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
       # One rendering for both the job summary and the PR comment. 60,000
       # bytes keeps the comment under GitHub's 65,536-character limit with
       # room for the wrapper; the full plan is always in the job log above.
@@ -173,6 +218,11 @@ jobs:
         id: render
         env:
           HAS_CHANGES: ${{ steps.plan.outputs.has-changes }}
+          DESTROY_COUNT: ${{ steps.destroys.outputs.count }}
+          DESTROY_LIST: ${{ steps.destroys.outputs.list }}
+          DESTROY_BLOCKED: ${{ steps.destroys.outputs.blocked }}
+          DESTROY_ALLOWED: ${{ steps.destroys.outputs.allowed }}
+          DESTROY_LABEL: ${{ inputs.destroy-label }}
           TITLE: "Terraform plan: `${{ inputs.directory }}` (${{ inputs.environment }})"
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           # On a PR, github.sha is the merge commit, which isn't on the branch.
@@ -186,6 +236,23 @@ jobs:
               terraform show -no-color tfplan > "$RUNNER_TEMP/plan.txt"
               grep -E '^Plan:|^Changes to Outputs:' "$RUNNER_TEMP/plan.txt" | head -1 | sed 's/^/**/; s/$/**/'
               echo
+              if [ "${DESTROY_COUNT:-0}" -gt 0 ]; then
+                if [ "$DESTROY_BLOCKED" = "true" ]; then
+                  echo "> [!CAUTION]"
+                  echo "> **This plan deletes or replaces $DESTROY_COUNT resource(s), so this check fails.** If that is intended, add the \`$DESTROY_LABEL\` label and re-run the failed jobs."
+                elif [ "$DESTROY_ALLOWED" = "true" ]; then
+                  echo "> [!WARNING]"
+                  echo "> **This plan deletes or replaces $DESTROY_COUNT resource(s)**, accepted by the \`$DESTROY_LABEL\` label."
+                else
+                  echo "> [!WARNING]"
+                  echo "> **This plan deletes or replaces $DESTROY_COUNT resource(s).**"
+                fi
+                echo ">"
+                # Literal backticks: Markdown code spans, not expansions.
+                # shellcheck disable=SC2016
+                sed 's/^/> - `/; s/ (/` (/' "$DESTROY_LIST"
+                echo
+              fi
               echo '<details><summary>Show plan</summary>'
               echo
               echo '```hcl'
@@ -225,6 +292,15 @@ jobs:
           else
             gh api --method POST "$COMMENTS_URL" -f body="$body" > /dev/null
           fi
+
+      # After the comment, so the PR shows why it failed.
+      - name: Refuse an unreviewed destroy
+        if: steps.destroys.outputs.blocked == 'true'
+        env:
+          DESTROY_LABEL: ${{ inputs.destroy-label }}
+        run: |
+          echo "::error::The plan deletes or replaces resources (listed above). Add the '$DESTROY_LABEL' label to the PR if that is intended, then re-run the failed jobs."
+          exit 1
 
       - name: Terraform apply
         if: inputs.apply && steps.plan.outputs.has-changes == 'true'

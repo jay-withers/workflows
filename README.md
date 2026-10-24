@@ -73,6 +73,8 @@ Plans one root module against one environment with Azure credentials, and option
 
 On a pull request, the plan is posted as a PR comment: one per directory and environment, edited in place on every push, with a one-line summary (`Plan: 1 to add, 0 to change, 0 to destroy.`) and the full plan behind a collapsible section.
 
+**A plan that deletes or replaces anything fails on a pull request** unless the PR carries the `allow-destroy` label (`destroy-label` input). The comment lists each resource and whether it is deleted or replaced. To accept it, add the label and use "Re-run failed jobs": the label is read from the API at run time, because a re-run replays the original event. The point is auto-merge: a provider major from Renovate can force-replace a Key Vault or storage account, and a check that only fails on errors would let that merge and apply unreviewed. On `main`, destroys are listed as warnings but never block the apply, since the PR was the review.
+
 The job runs in the GitHub environment named by `environment` and reads `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_SUBSCRIPTION_ID` from that environment's variables. Authentication is GitHub OIDC, and because the job is in an environment, the token's subject is `<repo prefix>:environment:<environment>` for plans and applies alike. The identity needs one federated credential with that subject per environment. Read the repo prefix from `gh api repos/<owner>/<repo>/actions/oidc/customization/sub` (`sub_claim_prefix`): newer repos use immutable subjects such as `repo:owner@123/repo@456`, not `repo:owner/repo`.
 
 ```yaml
@@ -122,6 +124,7 @@ jobs:
 | `client-id` | `""` | Overrides the environment's `AZURE_CLIENT_ID` |
 | `tenant-id` | `""` | Overrides the environment's `AZURE_TENANT_ID` |
 | `subscription-id` | `""` | Overrides the environment's `AZURE_SUBSCRIPTION_ID` |
+| `destroy-label` | `allow-destroy` | PR label that accepts a plan which deletes or replaces resources |
 | `runs-on` | `ubuntu-latest` | Runner label |
 
 Notes:
