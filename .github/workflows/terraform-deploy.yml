@@ -194,13 +194,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BODY_FILE: ${{ steps.render.outputs.body }}
           MARKER: "<!-- terraform-deploy:${{ inputs.directory }}:${{ inputs.environment }} -->"
+          REPOSITORY: ${{ github.repository }}
           COMMENTS_URL: repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments
         run: |
           body="$(printf '%s\n%s' "$MARKER" "$(cat "$BODY_FILE")")"
           id="$(gh api --paginate "$COMMENTS_URL" \
             --jq "[.[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$MARKER\")))][0].id // empty" | head -1)"
           if [ -n "$id" ]; then
-            gh api --method PATCH "repos/${{ github.repository }}/issues/comments/$id" -f body="$body" > /dev/null
+            gh api --method PATCH "repos/$REPOSITORY/issues/comments/$id" -f body="$body" > /dev/null
           else
             gh api --method POST "$COMMENTS_URL" -f body="$body" > /dev/null
           fi
