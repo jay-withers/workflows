@@ -131,10 +131,12 @@ jobs:
       # lock timeout covers a PR plan overlapping an apply on main.
       - name: Terraform plan
         id: plan
+        env:
+          TF_ENVIRONMENT: ${{ inputs.environment }}
         run: |
           set +e
           terraform plan -input=false -no-color -lock-timeout=5m \
-            -var-file="environments/${{ inputs.environment }}.tfvars" \
+            -var-file="environments/${TF_ENVIRONMENT}.tfvars" \
             -out=tfplan -detailed-exitcode
           code=$?
           set -e
