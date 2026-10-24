@@ -123,7 +123,9 @@ jobs:
           terraform_wrapper: false
 
       - name: Terraform init
-        run: terraform init -input=false -backend-config="backends/${{ inputs.environment }}.hcl"
+        env:
+          TF_ENVIRONMENT: ${{ inputs.environment }}
+        run: terraform init -input=false -backend-config="backends/${TF_ENVIRONMENT}.hcl"
 
       # -detailed-exitcode: 0 is no changes, 2 is changes, 1 is an error. The
       # lock timeout covers a PR plan overlapping an apply on main.
