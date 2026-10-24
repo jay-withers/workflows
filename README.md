@@ -136,6 +136,7 @@ Notes:
 - The calling job must grant `id-token: write` and `contents: read`, plus `pull-requests: write` on a PR for the plan comment and the labels. The job inherits the caller's grant rather than requesting its own, so an apply caller that doesn't grant `pull-requests: write` still runs.
 - The check reports as `<caller job id> / Plan (<environment>)` or `/ Apply (<environment>)`.
 - Applies share one concurrency group per directory and environment; plans are grouped by ref, so one PR's plan never displaces another's or a pending apply. An in-progress run is never cancelled. Plans wait up to five minutes for the state lock.
+- **A failed apply opens an issue** labelled `deploy-failed`, as Container Apps deploy does (one per directory and environment, closed by the next successful apply). Apply callers must grant `issues: write`; without it the step only warns.
 - The plan is also written to the run's job summary, truncated at 60,000 bytes like the comment. The job log always has the full plan.
 - Plan output is as public as the repo's Actions logs already are. Terraform masks `sensitive` values in both.
 
@@ -156,6 +157,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
+      issues: write # the deploy-failed issue
     uses: jay-withers/workflows/.github/workflows/container-apps-deploy.yml@main
     with:
       version: ${{ inputs.version }}
@@ -179,6 +181,7 @@ Notes:
 - The target receives `IMAGE_TAG` and `ENV` on the command line. `.terraform-version` is read from the repo root or `terraform/`.
 - One deploy runs at a time per repo and environment; a newer pending deploy replaces an older one, and an in-progress deploy is never cancelled. The concurrency group is separate from Terraform deploy's, so a merge that changes both runs them side by side. That's safe while the image and its env vars are under `ignore_changes` in Terraform, as `make deploy` assumes.
 - Refused on a `pull_request` event.
+- **A failed deploy opens an issue** labelled `deploy-failed`, @-mentioning the repo owner and linking the run; a repeat failure comments on it and the next success closes it. GitHub emails a failed run only to whoever triggered it, and Renovate's auto-merges trigger most deploys, so without this nobody hears. The caller must grant `issues: write` (and `cd-tag` too, when it calls `cd-publish`); without it the step only warns.
 
 ## Pre-commit CI
 

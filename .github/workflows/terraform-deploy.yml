@@ -329,3 +329,44 @@ jobs:
       - name: Terraform apply
         if: inputs.apply && steps.plan.outputs.has-changes == 'true'
         run: terraform apply -input=false -no-color tfplan
+
+      # A failed apply on main opens an issue, because GitHub emails a failed run
+      # only to whoever triggered it, and most of these are triggered by
+      # Renovate's auto-merge, so nobody would hear. The issue @-mentions the
+      # repo owner. Needs the caller to grant `issues: write`; without it this
+      # warns and the job's result is unchanged. Cancelled runs are ignored.
+      - name: Report the outcome as an issue
+        if: always() && inputs.apply && github.event_name != 'pull_request' && job.status != 'cancelled'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          OUTCOME: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WHAT: "Terraform apply of `${{ inputs.directory }}` to ${{ inputs.environment }}"
+          TITLE: "Terraform apply to ${{ inputs.environment }} failed (${{ inputs.directory }})"
+          MARKER: "<!-- deploy-failed:terraform-deploy:${{ inputs.directory }}:${{ inputs.environment }} -->"
+          REF: ${{ github.sha }}
+        run: |
+          # One open issue per workflow, environment (and directory), found
+          # by the hidden marker in its body. A repeat failure comments on it;
+          # the next success closes it.
+          label=deploy-failed
+          existing="$(gh issue list -R "$REPOSITORY" --label "$label" --state open \
+            --json number,body --jq ".[] | select(.body | contains(\"$MARKER\")) | .number" | head -1)"
+          if [ "$OUTCOME" = "failure" ]; then
+            gh label create "$label" -R "$REPOSITORY" --color B60205 \
+              --description "A deploy on main failed. Closed by the next success." 2>/dev/null || true
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" -R "$REPOSITORY" --body "Failed again: $RUN_URL (\`$REF\`)" > /dev/null
+            else
+              body="$(printf '%s\n%s\n\n%s\n\n%s\n' "$MARKER" \
+                "@$OWNER $WHAT failed for \`$REF\`." \
+                "Run: $RUN_URL" \
+                "This issue closes itself when the next one succeeds. Re-run the failed run once the cause is fixed.")"
+              gh issue create -R "$REPOSITORY" --title "$TITLE" --label "$label" --body "$body" > /dev/null
+            fi
+          elif [ -n "$existing" ]; then
+            gh issue close "$existing" -R "$REPOSITORY" --comment "Recovered: $RUN_URL (\`$REF\`)" > /dev/null
+          fi
