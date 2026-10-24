@@ -70,9 +70,28 @@ Notes:
 
 Plans one root module against one environment with Azure credentials, and optionally applies the saved plan in the same job. A PR calls it with `apply: false`; a push to `main` calls it with `apply: true`. Apply runs the exact plan printed above it, and is skipped when the plan has no changes.
 
+On a pull request, the plan is posted as a PR comment: one per directory and environment, edited in place on every push, with a one-line summary (`Plan: 1 to add, 0 to change, 0 to destroy.`) and the full plan behind a collapsible section.
+
 Authentication is GitHub OIDC: the identity's federated credentials must trust `repo:<owner>/<repo>:pull_request` for plans and `repo:<owner>/<repo>:ref:refs/heads/main` for applies. Do not run the job in a GitHub Environment — that changes the OIDC subject to `environment:<name>` and the login fails.
 
 ```yaml
+# Plan on PR (the caller's ci-terraform)
+jobs:
+  plan:
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write # the plan comment
+    uses: jay-withers/workflows/.github/workflows/terraform-deploy.yml@main
+    with:
+      environment: dev
+      client-id: ${{ vars.AZURE_CLIENT_ID }}
+      tenant-id: ${{ vars.AZURE_TENANT_ID }}
+      subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+```
+
+```yaml
+# Apply on merge (the caller's cd-terraform)
 name: cd-terraform
 
 on:
@@ -112,10 +131,11 @@ jobs:
 
 Notes:
 
-- The calling job must grant `id-token: write` and `contents: read`.
+- The calling job must grant `id-token: write` and `contents: read`, plus `pull-requests: write` on a PR for the plan comment. The job inherits the caller's grant rather than requesting its own, so an apply caller that doesn't grant `pull-requests: write` still runs.
 - The check reports as `<caller job id> / Plan (<environment>)` or `/ Apply (<environment>)`.
-- Plans and applies use separate concurrency groups per directory and environment, and an in-progress run is never cancelled. Plans wait up to five minutes for the state lock.
-- The plan is written to the run's job summary when it has changes.
+- Applies share one concurrency group per directory and environment; plans are grouped by ref, so one PR's plan never displaces another's or a pending apply. An in-progress run is never cancelled. Plans wait up to five minutes for the state lock.
+- The plan is also written to the run's job summary, truncated at 60,000 bytes like the comment. The job log always has the full plan.
+- Plan output is as public as the repo's Actions logs already are. Terraform masks `sensitive` values in both.
 
 ## Pre-commit CI
 

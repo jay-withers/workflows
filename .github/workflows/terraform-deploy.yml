@@ -65,16 +65,19 @@ jobs:
   deploy:
     name: ${{ inputs.apply && 'Apply' || 'Plan' }} (${{ inputs.environment }})
     runs-on: ${{ inputs.runs-on }}
-    permissions:
-      id-token: write
-      contents: read
-    # Plans and applies get separate groups: a PR plan queued behind an apply
-    # would otherwise replace the *pending* apply, and that apply would never
-    # run. Within the apply group, a newer pending run replacing an older one
-    # is fine — the newer commit on main contains the older one.
+    # No permissions block, deliberately: the job inherits the caller's grant.
+    # A PR caller grants `pull-requests: write` for the plan comment and an
+    # apply caller doesn't, and a job that *requested* it here would refuse to
+    # start for any caller that didn't grant it.
+    #
+    # Applies share one group per directory and environment; a newer pending
+    # apply replacing an older one is fine, since the newer commit on main
+    # contains the older one. Plans are grouped by ref, so a push to one PR
+    # can't replace another PR's pending plan, or a pending apply. Overlapping
+    # plans and applies wait on the state lock instead.
     # Never cancel in progress: killing an apply mid-run leaves state locked.
     concurrency:
-      group: terraform-deploy-${{ github.repository }}-${{ inputs.directory }}-${{ inputs.environment }}-${{ inputs.apply && 'apply' || 'plan' }}
+      group: terraform-deploy-${{ github.repository }}-${{ inputs.directory }}-${{ inputs.environment }}-${{ inputs.apply && 'apply' || github.ref }}
       cancel-in-progress: false
     outputs:
       has-changes: ${{ steps.plan.outputs.has-changes }}
@@ -137,18 +140,64 @@ jobs:
             *) exit "$code" ;;
           esac
 
-      - name: Summarise plan
-        if: steps.plan.outputs.has-changes == 'true'
+      # One rendering for both the job summary and the PR comment. 60,000
+      # bytes keeps the comment under GitHub's 65,536-character limit with
+      # room for the wrapper; the full plan is always in the job log above.
+      - name: Render plan
+        id: render
+        env:
+          HAS_CHANGES: ${{ steps.plan.outputs.has-changes }}
+          TITLE: "Terraform plan: `${{ inputs.directory }}` (${{ inputs.environment }})"
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # On a PR, github.sha is the merge commit, which isn't on the branch.
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
+          body="$RUNNER_TEMP/plan.md"
           {
-            echo "### Terraform plan: ${{ inputs.directory }} (${{ inputs.environment }})"
-            echo '<details><summary>Plan</summary>'
+            echo "### $TITLE"
             echo
-            echo '```'
-            terraform show -no-color tfplan | head -c 60000
-            echo '```'
-            echo '</details>'
-          } >> "$GITHUB_STEP_SUMMARY"
+            if [ "$HAS_CHANGES" = "true" ]; then
+              terraform show -no-color tfplan > "$RUNNER_TEMP/plan.txt"
+              grep -E '^Plan:|^Changes to Outputs:' "$RUNNER_TEMP/plan.txt" | head -1 | sed 's/^/**/; s/$/**/'
+              echo
+              echo '<details><summary>Show plan</summary>'
+              echo
+              echo '```hcl'
+              head -c 60000 "$RUNNER_TEMP/plan.txt"
+              if [ "$(wc -c < "$RUNNER_TEMP/plan.txt")" -gt 60000 ]; then
+                echo
+                echo "... truncated, see the run for the full plan"
+              fi
+              echo '```'
+              echo '</details>'
+            else
+              echo "**No changes.** Infrastructure matches the configuration."
+            fi
+            echo
+            echo "[Run]($RUN_URL) · \`${SHA:0:7}\`"
+          } > "$body"
+          cat "$body" >> "$GITHUB_STEP_SUMMARY"
+          echo "body=$body" >> "$GITHUB_OUTPUT"
+
+      # One comment per directory and environment, edited in place on every
+      # push, found by the hidden marker on its first line. Needs the caller
+      # to grant `pull-requests: write`.
+      - name: Comment plan on the PR
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BODY_FILE: ${{ steps.render.outputs.body }}
+          MARKER: "<!-- terraform-deploy:${{ inputs.directory }}:${{ inputs.environment }} -->"
+          COMMENTS_URL: repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments
+        run: |
+          body="$(printf '%s\n%s' "$MARKER" "$(cat "$BODY_FILE")")"
+          id="$(gh api --paginate "$COMMENTS_URL" \
+            --jq "[.[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$MARKER\")))][0].id // empty" | head -1)"
+          if [ -n "$id" ]; then
+            gh api --method PATCH "repos/${{ github.repository }}/issues/comments/$id" -f body="$body" > /dev/null
+          else
+            gh api --method POST "$COMMENTS_URL" -f body="$body" > /dev/null
+          fi
 
       - name: Terraform apply
         if: inputs.apply && steps.plan.outputs.has-changes == 'true'
