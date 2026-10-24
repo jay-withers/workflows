@@ -5,6 +5,7 @@ Reusable GitHub Actions workflows, called from other repositories via `workflow_
 | Workflow | Purpose |
 | --- | --- |
 | [`terraform.yml`](.github/workflows/terraform.yml) | Terraform CI: credential-free init, validate and optional `terraform test` across one or more root modules |
+| [`terraform-deploy.yml`](.github/workflows/terraform-deploy.yml) | Terraform CD: OIDC to Azure, plan one root module for one environment, and optionally apply the saved plan |
 | [`pre-commit.yml`](.github/workflows/pre-commit.yml) | Runs all pre-commit hooks against the full repository |
 | [`python.yml`](.github/workflows/python.yml) | Python CI: runs a project's test suite with uv |
 | [`docker.yml`](.github/workflows/docker.yml) | Container images: builds one or more images, optionally pushing them under immutable tags |
@@ -15,7 +16,7 @@ Reusable GitHub Actions workflows, called from other repositories via `workflow_
 
 Credential-free validation of every root module in the calling repository: `terraform init -backend=false` then `terraform validate`, one matrix leg per directory, plus an optional `terraform test` job for repos whose tests mock their providers.
 
-There is no plan or apply job, deliberately. A plan needs Azure credentials and only succeeds once the configuration's dependencies already exist — root modules resolve each other with data sources, so a plan against a not-yet-applied dependency fails at plan time and reports a CI failure for something that is not a defect. Applies are run by hand against remote state.
+There is no plan or apply job, deliberately. A plan needs Azure credentials and only succeeds once the configuration's dependencies already exist — root modules resolve each other with data sources, so a plan against a not-yet-applied dependency fails at plan time and reports a CI failure for something that is not a defect. For a credentialled plan, and apply on merge, see [Terraform deploy](#terraform-deploy).
 
 `-backend=false` is what keeps this credential-free: a repo whose `backend.tf` points at a real remote state account still validates on a fresh clone with no Azure auth.
 
@@ -64,6 +65,57 @@ Notes:
   A job gated this way needs its own always-reporting gate before it can be a required check — `<caller job id> / Terraform` covers only what runs *inside* this workflow.
 - The Terraform version comes from a `.terraform-version` file (the [tfenv](https://github.com/tfutils/tfenv) convention) — looked up in each directory first, then the repo root. Renovate's built-in `terraform-version` manager (part of `config:recommended`) keeps it bumped.
 - `fmt`, TFLint and Checkov are not run here — they belong to `pre-commit.yml`.
+
+## Terraform deploy
+
+Plans one root module against one environment with Azure credentials, and optionally applies the saved plan in the same job. A PR calls it with `apply: false`; a push to `main` calls it with `apply: true`. Apply runs the exact plan printed above it, and is skipped when the plan has no changes.
+
+Authentication is GitHub OIDC: the identity's federated credentials must trust `repo:<owner>/<repo>:pull_request` for plans and `repo:<owner>/<repo>:ref:refs/heads/main` for applies. Do not run the job in a GitHub Environment — that changes the OIDC subject to `environment:<name>` and the login fails.
+
+```yaml
+name: cd-terraform
+
+on:
+  push:
+    branches: [main]
+    paths: ["terraform/**", ".terraform-version"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    permissions:
+      id-token: write
+      contents: read
+    uses: jay-withers/workflows/.github/workflows/terraform-deploy.yml@main
+    with:
+      environment: dev
+      apply: true
+      client-id: ${{ vars.AZURE_CLIENT_ID }}
+      tenant-id: ${{ vars.AZURE_TENANT_ID }}
+      subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+```
+
+### Terraform deploy inputs
+
+| Input | Default | Description |
+| --- | --- | --- |
+| `environment` | `dev` | Picks `backends/<environment>.hcl` and `environments/<environment>.tfvars` inside `directory` |
+| `directory` | `terraform` | Root-module directory, relative to the repo root |
+| `apply` | `false` | Apply the saved plan when it has changes. Refused on `pull_request` |
+| `client-id` | (required) | Client ID of the federated Azure identity |
+| `tenant-id` | (required) | Entra tenant ID |
+| `subscription-id` | (required) | Azure subscription ID |
+| `runs-on` | `ubuntu-latest` | Runner label |
+
+Notes:
+
+- The calling job must grant `id-token: write` and `contents: read`.
+- The check reports as `<caller job id> / Plan (<environment>)` or `/ Apply (<environment>)`.
+- Plans and applies use separate concurrency groups per directory and environment, and an in-progress run is never cancelled. Plans wait up to five minutes for the state lock.
+- The plan is written to the run's job summary when it has changes.
 
 ## Pre-commit CI
 
