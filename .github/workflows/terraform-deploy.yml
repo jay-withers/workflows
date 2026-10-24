@@ -12,6 +12,13 @@ name: Terraform deploy
 # applied is exactly what was printed above it. It is skipped when the plan has
 # no changes.
 #
+# The job runs in the GitHub environment named by `environment`, for two
+# reasons. The Azure identity's details live there as environment variables
+# (AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID), which only a job
+# in that environment can read. And the OIDC token's subject becomes
+# `<repo prefix>:environment:<environment>` for plans and applies alike, so one
+# federated credential per environment covers both.
+#
 # This is deliberately separate from terraform.yml, which stays credential-free:
 # a plan needs an identity with read on everything the configuration touches
 # and only succeeds once its dependencies exist, so only repos that meet both
@@ -22,9 +29,9 @@ on:
     inputs:
       environment:
         description: >-
-          Environment name. Picks `backends/<environment>.hcl` and
-          `environments/<environment>.tfvars` inside `directory`, and names the
-          concurrency group.
+          Environment name. The job runs in the GitHub environment of this
+          name, and it picks `backends/<environment>.hcl` and
+          `environments/<environment>.tfvars` inside `directory`.
         type: string
         default: dev
       directory:
@@ -39,19 +46,19 @@ on:
         default: false
       client-id:
         description: >-
-          Client ID of the Azure identity federated to this repo, usually
-          `vars.AZURE_CLIENT_ID`. Its federated credential must trust the
-          calling event's subject (`pull_request`, or `ref:refs/heads/main`).
+          Overrides the environment's AZURE_CLIENT_ID variable. Leave empty to
+          use it. Whichever is used, the identity's federated credential must
+          trust `<repo prefix>:environment:<environment>`.
         type: string
-        required: true
+        default: ""
       tenant-id:
-        description: Entra tenant ID, usually `vars.AZURE_TENANT_ID`.
+        description: Overrides the environment's AZURE_TENANT_ID variable.
         type: string
-        required: true
+        default: ""
       subscription-id:
-        description: Azure subscription ID, usually `vars.AZURE_SUBSCRIPTION_ID`.
+        description: Overrides the environment's AZURE_SUBSCRIPTION_ID variable.
         type: string
-        required: true
+        default: ""
       runs-on:
         description: Runner label.
         type: string
@@ -65,6 +72,7 @@ jobs:
   deploy:
     name: ${{ inputs.apply && 'Apply' || 'Plan' }} (${{ inputs.environment }})
     runs-on: ${{ inputs.runs-on }}
+    environment: ${{ inputs.environment }}
     # No permissions block, deliberately: the job inherits the caller's grant.
     # A PR caller grants `pull-requests: write` for the plan comment and an
     # apply caller doesn't, and a job that *requested* it here would refuse to
@@ -86,9 +94,9 @@ jobs:
         working-directory: ${{ inputs.directory }}
     env:
       ARM_USE_OIDC: "true"
-      ARM_CLIENT_ID: ${{ inputs.client-id }}
-      ARM_TENANT_ID: ${{ inputs.tenant-id }}
-      ARM_SUBSCRIPTION_ID: ${{ inputs.subscription-id }}
+      ARM_CLIENT_ID: ${{ inputs.client-id || vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ inputs.tenant-id || vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ inputs.subscription-id || vars.AZURE_SUBSCRIPTION_ID }}
       TF_IN_AUTOMATION: "true"
     steps:
       - name: Refuse to apply from a pull request
@@ -97,6 +105,16 @@ jobs:
         run: |
           echo "::error::apply: true is not allowed on a pull_request event."
           exit 1
+
+      - name: Check Azure settings
+        working-directory: .
+        run: |
+          for v in ARM_CLIENT_ID ARM_TENANT_ID ARM_SUBSCRIPTION_ID; do
+            if [ -z "${!v}" ]; then
+              echo "::error::$v is empty. Set AZURE_${v#ARM_} as a variable on the '${{ inputs.environment }}' environment, or pass the matching input."
+              exit 1
+            fi
+          done
 
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
