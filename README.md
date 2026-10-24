@@ -6,6 +6,7 @@ Reusable GitHub Actions workflows, called from other repositories via `workflow_
 | --- | --- |
 | [`terraform.yml`](.github/workflows/terraform.yml) | Terraform CI: credential-free init, validate and optional `terraform test` across one or more root modules |
 | [`terraform-deploy.yml`](.github/workflows/terraform-deploy.yml) | Terraform CD: OIDC to Azure, plan one root module for one environment, and optionally apply the saved plan |
+| [`container-apps-deploy.yml`](.github/workflows/container-apps-deploy.yml) | App CD: OIDC to Azure, then the caller's own `make deploy IMAGE_TAG=<version>` rolls a published image onto its Container Apps workloads |
 | [`pre-commit.yml`](.github/workflows/pre-commit.yml) | Runs all pre-commit hooks against the full repository |
 | [`python.yml`](.github/workflows/python.yml) | Python CI: runs a project's test suite with uv |
 | [`docker.yml`](.github/workflows/docker.yml) | Container images: builds one or more images, optionally pushing them under immutable tags |
@@ -131,6 +132,47 @@ Notes:
 - Applies share one concurrency group per directory and environment; plans are grouped by ref, so one PR's plan never displaces another's or a pending apply. An in-progress run is never cancelled. Plans wait up to five minutes for the state lock.
 - The plan is also written to the run's job summary, truncated at 60,000 bytes like the comment. The job log always has the full plan.
 - Plan output is as public as the repo's Actions logs already are. Terraform masks `sensitive` values in both.
+
+## Container Apps deploy
+
+Rolls a published image tag onto a repo's Azure Container Apps workloads by running the caller's own `make deploy IMAGE_TAG=<version> ENV=<environment>`. The make target stays the single definition of a deploy (which apps and jobs take the image, which env vars ride along, the guard against moving tags), so CI and a local `make deploy` can't drift. This workflow only supplies what the target needs unattended: a checkout of the release tag, Terraform (for `terraform output` against real state) and an `az` login.
+
+Authentication is the same as [Terraform deploy](#terraform-deploy): the job runs in the GitHub environment named by `environment`, reads `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_SUBSCRIPTION_ID` from its variables, and its OIDC subject is `<repo prefix>:environment:<environment>`. The identity needs whatever `make deploy` touches, typically Contributor on the app's resource group plus read access to the Terraform state.
+
+```yaml
+# Deploy after publishing (the caller's cd-publish)
+jobs:
+  publish:
+    # ... docker.yml with push: true and tags: ${{ inputs.version }}
+
+  deploy:
+    needs: publish
+    permissions:
+      id-token: write
+      contents: read
+    uses: jay-withers/workflows/.github/workflows/container-apps-deploy.yml@main
+    with:
+      version: ${{ inputs.version }}
+```
+
+### Container Apps deploy inputs
+
+| Input | Default | Description |
+| --- | --- | --- |
+| `version` | (required) | Image tag to deploy, and the git ref checked out |
+| `environment` | `dev` | GitHub environment the job runs in, and the `ENV=` passed to make |
+| `target` | `deploy` | Make target to run |
+| `client-id` | `""` | Overrides the environment's `AZURE_CLIENT_ID` |
+| `tenant-id` | `""` | Overrides the environment's `AZURE_TENANT_ID` |
+| `subscription-id` | `""` | Overrides the environment's `AZURE_SUBSCRIPTION_ID` |
+| `runs-on` | `ubuntu-latest` | Runner label |
+
+Notes:
+
+- The calling job must grant `id-token: write` and `contents: read`. When `cd-publish` is itself called from `cd-tag`, `cd-tag`'s calling job must grant `id-token: write` too: a called workflow never holds more than its caller.
+- The target receives `IMAGE_TAG` and `ENV` on the command line. `.terraform-version` is read from the repo root or `terraform/`.
+- One deploy runs at a time per repo and environment; a newer pending deploy replaces an older one, and an in-progress deploy is never cancelled. The concurrency group is separate from Terraform deploy's, so a merge that changes both runs them side by side. That's safe while the image and its env vars are under `ignore_changes` in Terraform, as `make deploy` assumes.
+- Refused on a `pull_request` event.
 
 ## Pre-commit CI
 

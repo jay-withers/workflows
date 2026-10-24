@@ -1,0 +1,138 @@
+name: Container Apps deploy
+
+# Rolls a published image tag onto a repo's Azure Container Apps workloads by
+# running the caller's own `make deploy IMAGE_TAG=<version>`, authenticated to
+# Azure with GitHub OIDC.
+#
+# The make target, not this workflow, knows what to deploy. Every consumer's
+# `make deploy` differs: which apps and jobs take the image, which env vars
+# ride along (IMAGE_TAG, container URLs read from `terraform output`), and the
+# guard against moving tags. Re-implementing that here would make two sources
+# of truth for one deploy, and the local `make deploy` would drift from CI.
+# So this workflow only supplies what the target needs to run unattended: the
+# code at the released tag, Terraform (for `terraform output` against real
+# state), and an `az` login.
+#
+# Like terraform-deploy.yml, the job runs in the GitHub environment named by
+# `environment`, reads AZURE_CLIENT_ID / AZURE_TENANT_ID /
+# AZURE_SUBSCRIPTION_ID from its variables, and so authenticates with the
+# `<repo prefix>:environment:<environment>` subject.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: >-
+          Image tag to deploy, normally the release tag the caller just
+          published (e.g. v1.2.3). Also the git ref checked out, so the
+          Makefile and Terraform outputs match the release.
+        type: string
+        required: true
+      environment:
+        description: >-
+          GitHub environment the job runs in, and the `ENV=` passed to make.
+        type: string
+        default: dev
+      target:
+        description: Make target to run.
+        type: string
+        default: deploy
+      client-id:
+        description: Overrides the environment's AZURE_CLIENT_ID variable.
+        type: string
+        default: ""
+      tenant-id:
+        description: Overrides the environment's AZURE_TENANT_ID variable.
+        type: string
+        default: ""
+      subscription-id:
+        description: Overrides the environment's AZURE_SUBSCRIPTION_ID variable.
+        type: string
+        default: ""
+      runs-on:
+        description: Runner label.
+        type: string
+        default: ubuntu-latest
+
+jobs:
+  deploy:
+    name: Deploy (${{ inputs.environment }})
+    runs-on: ${{ inputs.runs-on }}
+    environment: ${{ inputs.environment }}
+    # No permissions block, deliberately: the job inherits the caller's grant,
+    # which must include `id-token: write` and `contents: read`.
+    #
+    # One deploy at a time per repo and environment. A newer pending deploy
+    # replacing an older one is fine, since it carries a newer release. Never
+    # cancel in progress: a half-finished deploy leaves workloads on different
+    # images.
+    concurrency:
+      group: container-apps-deploy-${{ github.repository }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_CLIENT_ID: ${{ inputs.client-id || vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ inputs.tenant-id || vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ inputs.subscription-id || vars.AZURE_SUBSCRIPTION_ID }}
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "0"
+    steps:
+      - name: Refuse to deploy from a pull request
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "::error::Deploying is not allowed on a pull_request event."
+          exit 1
+
+      - name: Check Azure settings
+        env:
+          INPUT_ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          for v in ARM_CLIENT_ID ARM_TENANT_ID ARM_SUBSCRIPTION_ID; do
+            if [ -z "${!v}" ]; then
+              echo "::error::$v is empty. Set AZURE_${v#ARM_} as a variable on the '$INPUT_ENVIRONMENT' environment, or pass the matching input."
+              exit 1
+            fi
+          done
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.version }}
+
+      - name: Resolve Terraform version
+        id: tfversion
+        run: |
+          for file in .terraform-version terraform/.terraform-version; do
+            if [ -f "$file" ]; then
+              echo "version=$(cat "$file")" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "::error::No .terraform-version file found in the repo root or terraform/"
+          exit 1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ steps.tfversion.outputs.version }}
+          terraform_wrapper: false
+
+      - name: Azure login
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ env.ARM_CLIENT_ID }}
+          tenant-id: ${{ env.ARM_TENANT_ID }}
+          subscription-id: ${{ env.ARM_SUBSCRIPTION_ID }}
+
+      - name: Deploy
+        env:
+          TARGET: ${{ inputs.target }}
+          VERSION: ${{ inputs.version }}
+          TF_ENVIRONMENT: ${{ inputs.environment }}
+        run: make "$TARGET" IMAGE_TAG="$VERSION" ENV="$TF_ENVIRONMENT"
+
+      - name: Summary
+        env:
+          VERSION: ${{ inputs.version }}
+          TF_ENVIRONMENT: ${{ inputs.environment }}
+        run: echo "Deployed \`$VERSION\` to \`$TF_ENVIRONMENT\`." >> "$GITHUB_STEP_SUMMARY"
