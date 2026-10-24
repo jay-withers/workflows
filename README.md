@@ -73,6 +73,10 @@ Plans one root module against one environment with Azure credentials, and option
 
 On a pull request, the plan is posted as a PR comment: one per directory and environment, edited in place on every push, with a one-line summary (`Plan: 1 to add, 0 to change, 0 to destroy.`) and the full plan behind a collapsible section.
 
+**On a pull request, a plan with any changes fails until it is approved.** The job adds a `terraform-approval-required` label (`pending-label`) to the PR while it waits, and the comment says what to do. To approve, review the plan, add the `terraform-approved` label (`approval-label`) and use "Re-run failed jobs": labels are read from the API at run time, because a re-run replays the original event. Merging then applies it. A plan with no changes passes and removes the pending label. Deletes and replaces are also listed in a CAUTION block, since those are the ones to read twice. The point is auto-merge: Renovate merges once checks are green and `cd-terraform` applies on merge, so without this a provider major could force-replace a Key Vault with nobody looking. Open approvals are listed by repo-agent's weekly digest, which reads the pending label. On `main` nothing here blocks the apply, since the PR was the review.
+
+The approval label stays on the PR across later pushes, including a Renovate rebase. Remove it if the plan changes after you approve.
+
 The job runs in the GitHub environment named by `environment` and reads `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_SUBSCRIPTION_ID` from that environment's variables. Authentication is GitHub OIDC, and because the job is in an environment, the token's subject is `<repo prefix>:environment:<environment>` for plans and applies alike. The identity needs one federated credential with that subject per environment. Read the repo prefix from `gh api repos/<owner>/<repo>/actions/oidc/customization/sub` (`sub_claim_prefix`): newer repos use immutable subjects such as `repo:owner@123/repo@456`, not `repo:owner/repo`.
 
 ```yaml
@@ -122,12 +126,14 @@ jobs:
 | `client-id` | `""` | Overrides the environment's `AZURE_CLIENT_ID` |
 | `tenant-id` | `""` | Overrides the environment's `AZURE_TENANT_ID` |
 | `subscription-id` | `""` | Overrides the environment's `AZURE_SUBSCRIPTION_ID` |
+| `approval-label` | `terraform-approved` | PR label that approves a plan with changes |
+| `pending-label` | `terraform-approval-required` | PR label the job keeps on a PR while a plan with changes awaits approval |
 | `runs-on` | `ubuntu-latest` | Runner label |
 
 Notes:
 
 - Each run shows as a deployment to the environment on the PR or commit, plans included, because that is how GitHub records a job running in an environment. Required reviewers or branch rules on the environment apply to plans too.
-- The calling job must grant `id-token: write` and `contents: read`, plus `pull-requests: write` on a PR for the plan comment. The job inherits the caller's grant rather than requesting its own, so an apply caller that doesn't grant `pull-requests: write` still runs.
+- The calling job must grant `id-token: write` and `contents: read`, plus `pull-requests: write` on a PR for the plan comment and the labels. The job inherits the caller's grant rather than requesting its own, so an apply caller that doesn't grant `pull-requests: write` still runs.
 - The check reports as `<caller job id> / Plan (<environment>)` or `/ Apply (<environment>)`.
 - Applies share one concurrency group per directory and environment; plans are grouped by ref, so one PR's plan never displaces another's or a pending apply. An in-progress run is never cancelled. Plans wait up to five minutes for the state lock.
 - The plan is also written to the run's job summary, truncated at 60,000 bytes like the comment. The job log always has the full plan.

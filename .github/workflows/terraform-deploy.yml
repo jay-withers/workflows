@@ -59,6 +59,20 @@ on:
         description: Overrides the environment's AZURE_SUBSCRIPTION_ID variable.
         type: string
         default: ""
+      approval-label:
+        description: >-
+          PR label that approves a plan with changes. On a pull request, a plan
+          that changes anything fails the job unless the PR carries this label,
+          so no infrastructure change merges (and applies) unreviewed.
+        type: string
+        default: terraform-approved
+      pending-label:
+        description: >-
+          PR label the job adds while a plan with changes awaits approval, and
+          removes otherwise, so open approvals can be found (repo-agent's
+          weekly digest reads it).
+        type: string
+        default: terraform-approval-required
       runs-on:
         description: Runner label.
         type: string
@@ -166,6 +180,61 @@ jobs:
             *) exit "$code" ;;
           esac
 
+      # Every infrastructure change is a decision, not a routine update: a
+      # provider major can force-replace a Key Vault, and Renovate auto-merges
+      # once checks are green, after which cd-terraform applies. So on a pull
+      # request, a plan with any changes fails the job until the PR carries
+      # `approval-label`, and the job keeps `pending-label` on the PR while it
+      # waits so open approvals can be listed. Labels are read from the API
+      # rather than the event payload, because "Re-run failed jobs" replays the
+      # original payload, from before the label was added. Deletes and
+      # replaces are listed separately, since those are the ones to read
+      # twice. On main the PR was the review, so nothing here blocks an apply.
+      - name: Check for approval
+        id: approval
+        if: steps.plan.outputs.has-changes == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          APPROVAL_LABEL: ${{ inputs.approval-label }}
+        run: |
+          list="$RUNNER_TEMP/destroys.txt"
+          terraform show -json tfplan \
+            | jq -r '.resource_changes[]? | select(.change.actions | index("delete"))
+                     | "\(.address) (\(if (.change.actions | index("create")) then "replace" else "delete" end))"' \
+            > "$list"
+          count="$(wc -l < "$list" | tr -d ' ')"
+          echo "destroy-count=$count" >> "$GITHUB_OUTPUT"
+          echo "destroy-list=$list" >> "$GITHUB_OUTPUT"
+          while read -r line; do echo "::warning::Plan deletes $line"; done < "$list"
+
+          [ "$EVENT_NAME" = "pull_request" ] || exit 0
+          if gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" --jq '.labels[].name' | grep -qxF "$APPROVAL_LABEL"; then
+            echo "approved=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "blocked=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Adding a label that does not exist yet creates it. Removing one that is
+      # not on the PR 404s, which is the expected case and ignored.
+      - name: Mark the PR as awaiting approval
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PENDING_LABEL: ${{ inputs.pending-label }}
+          BLOCKED: ${{ steps.approval.outputs.blocked }}
+        run: |
+          if [ "$BLOCKED" = "true" ]; then
+            gh api --method POST "repos/$REPOSITORY/issues/$PR_NUMBER/labels" -f "labels[]=$PENDING_LABEL" > /dev/null
+          else
+            encoded="$(jq -rn --arg l "$PENDING_LABEL" '$l|@uri')"
+            gh api --method DELETE "repos/$REPOSITORY/issues/$PR_NUMBER/labels/$encoded" > /dev/null 2>&1 || true
+          fi
+
       # One rendering for both the job summary and the PR comment. 60,000
       # bytes keeps the comment under GitHub's 65,536-character limit with
       # room for the wrapper; the full plan is always in the job log above.
@@ -173,6 +242,11 @@ jobs:
         id: render
         env:
           HAS_CHANGES: ${{ steps.plan.outputs.has-changes }}
+          DESTROY_COUNT: ${{ steps.approval.outputs.destroy-count }}
+          DESTROY_LIST: ${{ steps.approval.outputs.destroy-list }}
+          BLOCKED: ${{ steps.approval.outputs.blocked }}
+          APPROVED: ${{ steps.approval.outputs.approved }}
+          APPROVAL_LABEL: ${{ inputs.approval-label }}
           TITLE: "Terraform plan: `${{ inputs.directory }}` (${{ inputs.environment }})"
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           # On a PR, github.sha is the merge commit, which isn't on the branch.
@@ -186,6 +260,23 @@ jobs:
               terraform show -no-color tfplan > "$RUNNER_TEMP/plan.txt"
               grep -E '^Plan:|^Changes to Outputs:' "$RUNNER_TEMP/plan.txt" | head -1 | sed 's/^/**/; s/$/**/'
               echo
+              if [ "$BLOCKED" = "true" ]; then
+                echo "> [!IMPORTANT]"
+                echo "> **This plan changes infrastructure, so this check fails until it is approved.** Review the plan, then add the \`$APPROVAL_LABEL\` label and re-run the failed jobs. Merging then applies it."
+                echo
+              elif [ "$APPROVED" = "true" ]; then
+                echo "Approved by the \`$APPROVAL_LABEL\` label."
+                echo
+              fi
+              if [ "${DESTROY_COUNT:-0}" -gt 0 ]; then
+                echo "> [!CAUTION]"
+                echo "> **Deletes or replaces $DESTROY_COUNT resource(s):**"
+                echo ">"
+                # Literal backticks: Markdown code spans, not expansions.
+                # shellcheck disable=SC2016
+                sed 's/^/> - `/; s/ (/` (/' "$DESTROY_LIST"
+                echo
+              fi
               echo '<details><summary>Show plan</summary>'
               echo
               echo '```hcl'
@@ -225,6 +316,15 @@ jobs:
           else
             gh api --method POST "$COMMENTS_URL" -f body="$body" > /dev/null
           fi
+
+      # After the comment, so the PR shows why it failed.
+      - name: Refuse an unapproved change
+        if: steps.approval.outputs.blocked == 'true'
+        env:
+          APPROVAL_LABEL: ${{ inputs.approval-label }}
+        run: |
+          echo "::error::The plan changes infrastructure. Review it, then add the '$APPROVAL_LABEL' label to the PR and re-run the failed jobs."
+          exit 1
 
       - name: Terraform apply
         if: inputs.apply && steps.plan.outputs.has-changes == 'true'
