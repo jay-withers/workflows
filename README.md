@@ -72,7 +72,7 @@ Plans one root module against one environment with Azure credentials, and option
 
 On a pull request, the plan is posted as a PR comment: one per directory and environment, edited in place on every push, with a one-line summary (`Plan: 1 to add, 0 to change, 0 to destroy.`) and the full plan behind a collapsible section.
 
-Authentication is GitHub OIDC: the identity's federated credentials must trust `repo:<owner>/<repo>:pull_request` for plans and `repo:<owner>/<repo>:ref:refs/heads/main` for applies. Do not run the job in a GitHub Environment — that changes the OIDC subject to `environment:<name>` and the login fails.
+The job runs in the GitHub environment named by `environment` and reads `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_SUBSCRIPTION_ID` from that environment's variables. Authentication is GitHub OIDC, and because the job is in an environment, the token's subject is `<repo prefix>:environment:<environment>` for plans and applies alike. The identity needs one federated credential with that subject per environment. Read the repo prefix from `gh api repos/<owner>/<repo>/actions/oidc/customization/sub` (`sub_claim_prefix`): newer repos use immutable subjects such as `repo:owner@123/repo@456`, not `repo:owner/repo`.
 
 ```yaml
 # Plan on PR (the caller's ci-terraform)
@@ -85,9 +85,6 @@ jobs:
     uses: jay-withers/workflows/.github/workflows/terraform-deploy.yml@main
     with:
       environment: dev
-      client-id: ${{ vars.AZURE_CLIENT_ID }}
-      tenant-id: ${{ vars.AZURE_TENANT_ID }}
-      subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 ```
 
 ```yaml
@@ -112,25 +109,23 @@ jobs:
     with:
       environment: dev
       apply: true
-      client-id: ${{ vars.AZURE_CLIENT_ID }}
-      tenant-id: ${{ vars.AZURE_TENANT_ID }}
-      subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 ```
 
 ### Terraform deploy inputs
 
 | Input | Default | Description |
 | --- | --- | --- |
-| `environment` | `dev` | Picks `backends/<environment>.hcl` and `environments/<environment>.tfvars` inside `directory` |
+| `environment` | `dev` | GitHub environment the job runs in, and picks `backends/<environment>.hcl` and `environments/<environment>.tfvars` inside `directory` |
 | `directory` | `terraform` | Root-module directory, relative to the repo root |
 | `apply` | `false` | Apply the saved plan when it has changes. Refused on `pull_request` |
-| `client-id` | (required) | Client ID of the federated Azure identity |
-| `tenant-id` | (required) | Entra tenant ID |
-| `subscription-id` | (required) | Azure subscription ID |
+| `client-id` | `""` | Overrides the environment's `AZURE_CLIENT_ID` |
+| `tenant-id` | `""` | Overrides the environment's `AZURE_TENANT_ID` |
+| `subscription-id` | `""` | Overrides the environment's `AZURE_SUBSCRIPTION_ID` |
 | `runs-on` | `ubuntu-latest` | Runner label |
 
 Notes:
 
+- Each run shows as a deployment to the environment on the PR or commit, plans included, because that is how GitHub records a job running in an environment. Required reviewers or branch rules on the environment apply to plans too.
 - The calling job must grant `id-token: write` and `contents: read`, plus `pull-requests: write` on a PR for the plan comment. The job inherits the caller's grant rather than requesting its own, so an apply caller that doesn't grant `pull-requests: write` still runs.
 - The check reports as `<caller job id> / Plan (<environment>)` or `/ Apply (<environment>)`.
 - Applies share one concurrency group per directory and environment; plans are grouped by ref, so one PR's plan never displaces another's or a pending apply. An in-progress run is never cancelled. Plans wait up to five minutes for the state lock.
