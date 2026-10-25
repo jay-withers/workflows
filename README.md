@@ -168,6 +168,9 @@ jobs:
 | `version` | (required) | Image tag to deploy, and the git ref checked out |
 | `environment` | `dev` | GitHub environment the job runs in, and the `ENV=` passed to make |
 | `target` | `deploy` | Make target to run |
+| `smoke-target` | `smoke` | Make target proving the deployed version works. Skipped when the Makefile has no such target; empty disables it |
+| `live-target` | `deployed-tag` | Make target printing the live image tag (last line of stdout), recorded before the deploy as the rollback version |
+| `rollback` | `true` | On a failed deploy or smoke test, redeploy the recorded version. The run still fails |
 | `client-id` | `""` | Overrides the environment's `AZURE_CLIENT_ID` |
 | `tenant-id` | `""` | Overrides the environment's `AZURE_TENANT_ID` |
 | `subscription-id` | `""` | Overrides the environment's `AZURE_SUBSCRIPTION_ID` |
@@ -179,6 +182,10 @@ Notes:
 - The target receives `IMAGE_TAG` and `ENV` on the command line. `.terraform-version` is read from the repo root or `terraform/`.
 - One deploy runs at a time per repo and environment; a newer pending deploy replaces an older one, and an in-progress deploy is never cancelled. The concurrency group is separate from Terraform deploy's, so a merge that changes both runs them side by side. That's safe while the image and its env vars are under `ignore_changes` in Terraform, as `make deploy` assumes.
 - Refused on a `pull_request` event.
+- **Smoke test and rollback.** A green `make deploy` only means Azure accepted the image: apps that scale to zero can go live on a revision whose container never started. When the Makefile has a `smoke` target, the workflow runs `make deployed-tag ENV=…` first and keeps its last line as the version to fall back to, then `make deploy`, then `make smoke IMAGE_TAG=<version> ENV=…`. If either fails, it deploys and smoke-tests the recorded version, then fails the run anyway; the step summary and the `deploy-failed` issue say whether the rollback held. Both targets live in the caller, like `make deploy`:
+  - `deployed-tag` prints the tag currently configured (for example the part after `:` in the app's image) and exits 0, printing nothing on a first deploy.
+  - `smoke` exits non-zero unless `IMAGE_TAG` is what's running. For an app, poll its default FQDN until a `/healthz`-style endpoint reports `IMAGE_TAG` and readiness passes, allowing for a cold start. For a job, check its configured image; don't start it, since running a job has side effects.
+  - Rolling back redeploys an image, nothing else. A release whose data or schema change the previous version can't read must not rely on it.
 - **A failed deploy opens an issue** labelled `deploy-failed`, @-mentioning the repo owner and linking the run; a repeat failure comments on it and the next success closes it. GitHub emails a failed run only to whoever triggered it, and Renovate's auto-merges trigger most deploys, so without this nobody hears. The caller must grant `issues: write` (and `cd-tag` too, when it calls `cd-publish`); without it the step only warns.
 
 ## Pre-commit CI
