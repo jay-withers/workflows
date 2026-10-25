@@ -71,6 +71,22 @@ on:
           amd64 pays for every other architecture in build minutes.
         type: string
         default: linux/amd64
+      scan:
+        description: >-
+          Scan each image with Trivy and upload the findings to the repo's
+          Security tab (code scanning). Needs `security-events: write` from
+          the caller for the upload; without it the upload only warns.
+        type: boolean
+        default: true
+      scan-fail-on:
+        description: >-
+          Severities that fail the job when a vulnerability with a fix
+          available is found, comma-separated. Only applies to a build that
+          does not push (a pull request): a publish reports and never fails,
+          so a newly disclosed CVE cannot block deploying unrelated fixes.
+          Empty reports only.
+        type: string
+        default: CRITICAL,HIGH
       summary-note:
         description: >-
           Line appended to the job summary after the pushed references, for
@@ -196,9 +212,89 @@ jobs:
           context: ${{ matrix.image.context }}
           platforms: ${{ inputs.platforms }}
           push: ${{ inputs.push }}
-          tags: ${{ steps.refs.outputs.tags }}
+          # A pull request build is loaded into the local daemon under a
+          # local-only tag so Trivy can scan it; a pushed build is scanned
+          # from the registry instead. Loading needs a single platform.
+          load: ${{ !inputs.push && inputs.scan && !contains(inputs.platforms, ',') }}
+          # The local tag only on a build that does not push: pushed, it would
+          # go to Docker Hub.
+          tags: |
+            ${{ steps.refs.outputs.tags }}
+            ${{ !inputs.push && format('local-scan/{0}:{1}', matrix.image.name, github.run_id) || '' }}
           cache-from: type=gha,scope=${{ matrix.image.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}
+
+      # Trivy, on every build. Findings of every severity go to the Security
+      # tab, where repo-agent's weekly digest reads them. A pull request also
+      # fails on `scan-fail-on` severities that have a fix available: that is
+      # the one kind of finding a PR can act on (bump the base or the package),
+      # and it stops Renovate auto-merging an image that ships one. Unfixed
+      # findings never block; nothing in a PR can fix them. A publish never
+      # fails on a finding, since the image is already pushed and failing
+      # would only skip the deploy of whatever else that release carries.
+      # Accepted risks go in a `.trivyignore` at the repo root.
+      #
+      # Deliberately unpinned Trivy version, as in dev-containers' cd-scan: a
+      # scanner is only as good as its newest detection logic.
+      - name: Install Trivy
+        if: inputs.scan && (inputs.push || !contains(inputs.platforms, ','))
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: latest
+
+      - name: Scan ${{ matrix.image.name }}
+        id: scan
+        if: inputs.scan && (inputs.push || !contains(inputs.platforms, ','))
+        env:
+          PUSH: ${{ inputs.push }}
+          NAME: ${{ matrix.image.name }}
+          LOCAL_REF: local-scan/${{ matrix.image.name }}:${{ github.run_id }}
+          REFS: ${{ steps.refs.outputs.tags }}
+          FAIL_ON: ${{ inputs.scan-fail-on }}
+        run: |
+          if [ "$PUSH" = "true" ]; then
+            ref="$(printf '%s\n' "$REFS" | head -1)"
+          else
+            ref="$LOCAL_REF"
+          fi
+          echo "Scanning $ref"
+          ignore=()
+          if [ -f .trivyignore ]; then ignore=(--ignorefile .trivyignore); fi
+
+          # Everything, for the Security tab.
+          trivy image --quiet "${ignore[@]}" --format sarif \
+            --output "$RUNNER_TEMP/trivy-$NAME.sarif" "$ref"
+          echo "sarif=$RUNNER_TEMP/trivy-$NAME.sarif" >> "$GITHUB_OUTPUT"
+
+          # The gate: fixable findings at the failing severities. Printed as a
+          # table either way, so the log says what was found.
+          gate=0
+          if [ "$PUSH" != "true" ] && [ -n "$FAIL_ON" ]; then
+            trivy image --quiet --skip-db-update "${ignore[@]}" --ignore-unfixed \
+              --severity "$FAIL_ON" --exit-code 1 --format table "$ref" || gate=$?
+          else
+            trivy image --quiet --skip-db-update "${ignore[@]}" --ignore-unfixed \
+              --severity CRITICAL,HIGH --format table "$ref"
+          fi
+          echo "gate=$gate" >> "$GITHUB_OUTPUT"
+
+      - name: Upload ${{ matrix.image.name }} findings to code scanning
+        if: always() && steps.scan.outputs.sarif != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: ${{ steps.scan.outputs.sarif }}
+          category: trivy-${{ matrix.image.name }}
+
+      # Last, so the findings are uploaded before the job fails on them.
+      - name: Refuse fixable ${{ inputs.scan-fail-on }} vulnerabilities
+        if: steps.scan.outputs.gate != '' && steps.scan.outputs.gate != '0'
+        env:
+          NAME: ${{ matrix.image.name }}
+          FAIL_ON: ${{ inputs.scan-fail-on }}
+        run: |
+          echo "::error::$NAME has $FAIL_ON vulnerabilities with a fix available (table above). Update the base image or the package, or accept the risk in .trivyignore."
+          exit 1
 
       - name: Summarise
         if: inputs.push
