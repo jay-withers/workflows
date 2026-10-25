@@ -335,6 +335,14 @@ Notes:
 - **First push to a GHCR package needs two things `packages: write` cannot supply.** A new package is private whatever the repository's visibility, so make it public once if anything pulls anonymously; and `GITHUB_TOKEN` can only write to a package *linked* to the repository. A package first pushed by hand is user-scoped and unlinked, and the push fails `denied: permission_denied: write_package` — which reads like a missing permission rather than a missing link. The `org.opencontainers.image.source` label establishes the link, but only from a push that is already allowed, so either push once by hand with the label in place or grant the repository Write under the package's "Manage Actions access".
 - `platforms` is one platform by default. A manifest list with a single entry buys nothing, and a runtime that only ever runs amd64 pays for every other architecture in build minutes.
 
+### Vulnerability scanning
+
+Every build is scanned with [Trivy](https://trivy.dev/): a pull request build is loaded locally and scanned, a publish is scanned from the registry. Findings of every severity are uploaded to the repo's **Security** tab (code scanning, category `trivy-<image>`), where repo-agent's weekly digest reads them.
+
+A **pull request fails** on `scan-fail-on` severities (CRITICAL and HIGH by default) **that have a fix available**: the one kind of finding a PR can act on, by bumping the base image or the package, and the kind Renovate would otherwise auto-merge. Unfixed findings never block. A **publish never fails** on a finding, because the image is already pushed and failing would only skip deploying whatever else the release carries. Accepted risks go in a `.trivyignore` at the repo root (one CVE ID per line, with a comment saying why).
+
+The caller grants `security-events: write` for the upload. Without it the upload warns and the gate still works. A multi-platform build that doesn't push isn't scanned, since it can't be loaded locally.
+
 ### Docker inputs
 
 | Input | Default | Description |
@@ -347,6 +355,8 @@ Notes:
 | `registry` | `ghcr.io` | Registry host |
 | `image-prefix` | `""` | Path under the registry each name hangs off. Empty uses `owner/repo` |
 | `platforms` | `linux/amd64` | Buildx target platforms |
+| `scan` | `true` | Scan each image with Trivy and upload findings to code scanning (needs `security-events: write`) |
+| `scan-fail-on` | `CRITICAL,HIGH` | On a build that doesn't push, fail on these severities when a fix is available. Empty reports only |
 | `summary-note` | `""` | Markdown line appended to the job summary after the pushed references |
 | `runs-on` | `ubuntu-latest` | Runner label |
 
