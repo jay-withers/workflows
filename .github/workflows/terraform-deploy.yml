@@ -320,13 +320,17 @@ jobs:
             gh issue close "$existing" -R "$REPOSITORY" --comment "$why: $RUN_URL (\`${REF:0:7}\`)" > /dev/null
           fi
 
+      # Also runs on a plan-only push whose plan is clean: main and the
+      # environment then agree, so an open "apply failed" issue is stale and is
+      # closed, rather than waiting for a manual apply with nothing to do.
+      #
       # A failed apply on main opens an issue, because GitHub emails a failed run
       # only to whoever triggered it, and most of these are triggered by
       # Renovate's auto-merge, so nobody would hear. The issue @-mentions the
       # repo owner. Needs the caller to grant `issues: write`; without it this
       # warns and the job's result is unchanged. Cancelled runs are ignored.
       - name: Report the outcome as an issue
-        if: always() && inputs.apply && github.event_name != 'pull_request' && job.status != 'cancelled'
+        if: always() && github.event_name != 'pull_request' && job.status != 'cancelled' && (inputs.apply || steps.plan.outputs.has-changes == 'false')
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
