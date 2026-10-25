@@ -218,12 +218,16 @@ jobs:
           VERSION: ${{ inputs.version }}
           TF_ENVIRONMENT: ${{ inputs.environment }}
         run: |
+          # SMOKE_PHASE tells the smoke target which kind of deploy it checks. On
+          # a rollback it can skip what the old image may predate or what costs
+          # time while dev is down (a selfcheck run of each job, say): that
+          # image has already run here.
           deploy() {
             make "$TARGET" IMAGE_TAG="$1" ENV="$TF_ENVIRONMENT" || return 1
-            [ "$SMOKE" != true ] || make "$SMOKE_TARGET" IMAGE_TAG="$1" ENV="$TF_ENVIRONMENT"
+            [ "$SMOKE" != true ] || SMOKE_PHASE="$2" make "$SMOKE_TARGET" IMAGE_TAG="$1" ENV="$TF_ENVIRONMENT"
           }
 
-          if deploy "$VERSION"; then
+          if deploy "$VERSION" release; then
             if [ "$SMOKE" = true ]; then
               echo "Deployed and smoke-tested \`$VERSION\` on \`$TF_ENVIRONMENT\`." >> "$GITHUB_STEP_SUMMARY"
             else
@@ -240,7 +244,7 @@ jobs:
           fi
 
           echo "::group::Rolling back to $PREVIOUS"
-          if deploy "$PREVIOUS"; then
+          if deploy "$PREVIOUS" rollback; then
             echo "::endgroup::"
             echo "::error::Rolled back to $PREVIOUS, which passed its smoke test."
             echo "Deploying \`$VERSION\` failed; rolled back to \`$PREVIOUS\`, which is live and healthy." >> "$GITHUB_STEP_SUMMARY"
