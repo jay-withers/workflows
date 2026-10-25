@@ -114,6 +114,17 @@ jobs:
     # configured, and every push would fail on a permission the caller had
     # actually granted. Callers must set their own — the README's examples do.
     steps:
+      # This workflow builds whatever code it checks out. On `pull_request`
+      # that is the point (CI building the PR), and that event carries no
+      # secrets. Under `pull_request_target` the same build would run a
+      # stranger's code with the base repository's secrets and a write token,
+      # so that event is refused outright rather than trusted to every caller.
+      - name: Refuse pull_request_target
+        if: github.event_name == 'pull_request_target'
+        run: |
+          echo "::error::docker.yml must not run on pull_request_target: it builds the checked-out code."
+          exit 1
+
       - name: Checkout ${{ inputs.ref }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
