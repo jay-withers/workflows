@@ -86,13 +86,18 @@ jobs:
 
       - name: Resolve Terraform version
         id: tfversion
+        # The directory reaches the script as an environment variable, never
+        # interpolated into it: `${{ }}` in `run:` is pasted in as shell text,
+        # so a crafted value would execute.
+        env:
+          DIRECTORY: ${{ matrix.directory }}
         run: |
           if [ -f .terraform-version ]; then
             file=.terraform-version
           elif [ -f "$GITHUB_WORKSPACE/.terraform-version" ]; then
             file="$GITHUB_WORKSPACE/.terraform-version"
           else
-            echo "::error::No .terraform-version file found in ${{ matrix.directory }} or the repo root"
+            echo "::error::No .terraform-version file found in $DIRECTORY or the repo root"
             exit 1
           fi
           echo "version=$(cat "$file")" >> "$GITHUB_OUTPUT"
@@ -136,13 +141,18 @@ jobs:
 
       - name: Resolve Terraform version
         id: tfversion
+        # The directory reaches the script as an environment variable, never
+        # interpolated into it: `${{ }}` in `run:` is pasted in as shell text,
+        # so a crafted value would execute.
+        env:
+          DIRECTORY: ${{ matrix.directory }}
         run: |
           if [ -f .terraform-version ]; then
             file=.terraform-version
           elif [ -f "$GITHUB_WORKSPACE/.terraform-version" ]; then
             file="$GITHUB_WORKSPACE/.terraform-version"
           else
-            echo "::error::No .terraform-version file found in ${{ matrix.directory }} or the repo root"
+            echo "::error::No .terraform-version file found in $DIRECTORY or the repo root"
             exit 1
           fi
           echo "version=$(cat "$file")" >> "$GITHUB_OUTPUT"
