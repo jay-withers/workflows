@@ -30,7 +30,11 @@
     }
   },
   "image": "ghcr.io/jay-withers/dev-containers/base:latest@sha256:1edc86bea67724657f94bf55274e2140658b86587ca9a7e592a1306ebbd36edb",
+  "mounts": [
+    "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
+  ],
   "name": "template-pipelines",
   "postCreateCommand": "make install",
+  "postStartCommand": "sudo /usr/local/bin/docker-socket-setup",
   "remoteUser": "vscode"
 }
