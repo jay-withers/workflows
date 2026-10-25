@@ -17,6 +17,15 @@ name: Container Apps deploy
 # `environment`, reads AZURE_CLIENT_ID / AZURE_TENANT_ID /
 # AZURE_SUBSCRIPTION_ID from its variables, and so authenticates with the
 # `<repo prefix>:environment:<environment>` subject.
+#
+# A green `make deploy` only means Azure accepted the new image. The apps scale
+# to zero, so a new revision can go live without a container ever starting.
+# So when the caller's Makefile has a smoke target, the deploy is proven
+# instead: `make deployed-tag` records what is live first, `make smoke` checks
+# the new version is the one serving (or, for a job, the one configured), and
+# a failed deploy or smoke test rolls back to the recorded tag before failing
+# the run. Like the deploy itself, what "healthy" means stays in the caller's
+# Makefile. A repo without the target deploys exactly as before.
 
 on:
   workflow_call:
@@ -37,6 +46,26 @@ on:
         description: Make target to run.
         type: string
         default: deploy
+      smoke-target:
+        description: >-
+          Make target that proves a deployed version works, run after the
+          deploy with the same IMAGE_TAG and ENV. Skipped when the caller's
+          Makefile has no such target. Empty disables it.
+        type: string
+        default: smoke
+      live-target:
+        description: >-
+          Make target printing the image tag live before the deploy, as its
+          last line of stdout: the version to roll back to. Only run when the
+          smoke target exists.
+        type: string
+        default: deployed-tag
+      rollback:
+        description: >-
+          Redeploy the version that was live when the deploy or smoke test
+          fails. The run still fails, so the deploy-failed issue opens.
+        type: boolean
+        default: true
       client-id:
         description: Overrides the environment's AZURE_CLIENT_ID variable.
         type: string
@@ -144,18 +173,85 @@ jobs:
           tenant-id: ${{ env.ARM_TENANT_ID }}
           subscription-id: ${{ env.ARM_SUBSCRIPTION_ID }}
 
+      - name: Check for a smoke test
+        id: smoke
+        env:
+          SMOKE_TARGET: ${{ inputs.smoke-target }}
+        run: |
+          # `make -n` exits 2 on a missing target and executes no recipe.
+          if [ -n "$SMOKE_TARGET" ] && make -n "$SMOKE_TARGET" IMAGE_TAG=probe >/dev/null 2>&1; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No '$SMOKE_TARGET' make target, so this deploy is not smoke-tested or rolled back."
+          fi
+
+      - name: Record the live version
+        id: live
+        if: steps.smoke.outputs.enabled == 'true'
+        env:
+          LIVE_TARGET: ${{ inputs.live-target }}
+          TF_ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          # Not fatal: a first deploy has nothing live to roll back to.
+          if out="$(make -s "$LIVE_TARGET" ENV="$TF_ENVIRONMENT")"; then
+            # Only a valid image tag counts. On a first deploy the target
+            # prints nothing, and the last line would be someone's log output.
+            tag="$(printf '%s\n' "$out" | tail -n 1)"
+            if ! printf '%s' "$tag" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'; then
+              tag=""
+            fi
+            echo "Live before this deploy: ${tag:-nothing}"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::'make $LIVE_TARGET' failed, so a failed deploy can't be rolled back."
+          fi
+
       - name: Deploy
+        id: deploy
         env:
           TARGET: ${{ inputs.target }}
+          SMOKE_TARGET: ${{ inputs.smoke-target }}
+          SMOKE: ${{ steps.smoke.outputs.enabled }}
+          ROLLBACK: ${{ inputs.rollback }}
+          PREVIOUS: ${{ steps.live.outputs.tag }}
           VERSION: ${{ inputs.version }}
           TF_ENVIRONMENT: ${{ inputs.environment }}
-        run: make "$TARGET" IMAGE_TAG="$VERSION" ENV="$TF_ENVIRONMENT"
+        run: |
+          deploy() {
+            make "$TARGET" IMAGE_TAG="$1" ENV="$TF_ENVIRONMENT" || return 1
+            [ "$SMOKE" != true ] || make "$SMOKE_TARGET" IMAGE_TAG="$1" ENV="$TF_ENVIRONMENT"
+          }
 
-      - name: Summary
-        env:
-          VERSION: ${{ inputs.version }}
-          TF_ENVIRONMENT: ${{ inputs.environment }}
-        run: echo "Deployed \`$VERSION\` to \`$TF_ENVIRONMENT\`." >> "$GITHUB_STEP_SUMMARY"
+          if deploy "$VERSION"; then
+            if [ "$SMOKE" = true ]; then
+              echo "Deployed and smoke-tested \`$VERSION\` on \`$TF_ENVIRONMENT\`." >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "Deployed \`$VERSION\` to \`$TF_ENVIRONMENT\` (no smoke test)." >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit 0
+          fi
+
+          echo "::error::Deploying $VERSION to $TF_ENVIRONMENT failed."
+          if [ "$SMOKE" != true ] || [ "$ROLLBACK" != true ] || [ -z "$PREVIOUS" ] || [ "$PREVIOUS" = "$VERSION" ]; then
+            echo "Deploying \`$VERSION\` to \`$TF_ENVIRONMENT\` failed, with nothing to roll back to." >> "$GITHUB_STEP_SUMMARY"
+            echo "outcome=not rolled back" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          echo "::group::Rolling back to $PREVIOUS"
+          if deploy "$PREVIOUS"; then
+            echo "::endgroup::"
+            echo "::error::Rolled back to $PREVIOUS, which passed its smoke test."
+            echo "Deploying \`$VERSION\` failed; rolled back to \`$PREVIOUS\`, which is live and healthy." >> "$GITHUB_STEP_SUMMARY"
+            echo "outcome=rolled back to \`$PREVIOUS\`, which is live and healthy" >> "$GITHUB_OUTPUT"
+          else
+            echo "::endgroup::"
+            echo "::error::Rolling back to $PREVIOUS failed too. $TF_ENVIRONMENT may be down."
+            echo "Deploying \`$VERSION\` failed, and so did rolling back to \`$PREVIOUS\`. \`$TF_ENVIRONMENT\` may be down." >> "$GITHUB_STEP_SUMMARY"
+            echo "outcome=rolling back to \`$PREVIOUS\` failed too, so it may be down" >> "$GITHUB_OUTPUT"
+          fi
+          exit 1
 
       # A failed deploy opens an issue, because GitHub emails a failed run only
       # to whoever triggered it, and most of these are triggered by
@@ -175,6 +271,7 @@ jobs:
           TITLE: "Deploy to ${{ inputs.environment }} failed"
           MARKER: "<!-- deploy-failed:container-apps-deploy:${{ inputs.environment }} -->"
           REF: ${{ inputs.version }}
+          ROLLBACK_OUTCOME: ${{ steps.deploy.outputs.outcome }}
         run: |
           # One open issue per workflow, environment (and directory), found
           # by the hidden marker in its body. A repeat failure comments on it;
@@ -186,10 +283,10 @@ jobs:
             gh label create "$label" -R "$REPOSITORY" --color B60205 \
               --description "A deploy on main failed. Closed by the next success." 2>/dev/null || true
             if [ -n "$existing" ]; then
-              gh issue comment "$existing" -R "$REPOSITORY" --body "Failed again: $RUN_URL (\`$REF\`)" > /dev/null
+              gh issue comment "$existing" -R "$REPOSITORY" --body "Failed again: $RUN_URL (\`$REF\`)${ROLLBACK_OUTCOME:+, $ROLLBACK_OUTCOME}" > /dev/null
             else
               body="$(printf '%s\n%s\n\n%s\n\n%s\n' "$MARKER" \
-                "@$OWNER $WHAT failed for \`$REF\`." \
+                "@$OWNER $WHAT failed for \`$REF\`${ROLLBACK_OUTCOME:+, and $ROLLBACK_OUTCOME}." \
                 "Run: $RUN_URL" \
                 "This issue closes itself when the next one succeeds. Re-run the failed run once the cause is fixed.")"
               gh issue create -R "$REPOSITORY" --title "$TITLE" --label "$label" --body "$body" > /dev/null
