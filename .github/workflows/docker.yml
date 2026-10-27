@@ -217,6 +217,10 @@ jobs:
       # from a push that is already allowed — so either push once by hand with
       # the label in place, or grant the repository Write under the package's
       # "Manage Actions access".
+      - name: Resolve OS_PATCH_DATE
+        id: patch-date
+        run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
       - name: Build ${{ matrix.image.name }} for ${{ inputs.platforms }}
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -234,6 +238,17 @@ jobs:
             ${{ !inputs.push && format('local-scan/{0}:{1}', matrix.image.name, github.run_id) || '' }}
           cache-from: type=gha,scope=${{ matrix.image.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}
+          # The layer cache is keyed by instruction, so a Dockerfile's
+          # `apt-get upgrade`/`apk upgrade` step is reused until its line or the
+          # base digest changes, and security fixes published since then never
+          # reach the image: Trivy then fails the build on a "fixable"
+          # vulnerability the upgrade step was written to fix. A build arg
+          # invalidates the cache from where a Dockerfile declares it, so one
+          # that changes daily re-runs only what follows `ARG OS_PATCH_DATE`
+          # (put it just before the upgrade step) once a day, and leaves
+          # everything above it cached. A Dockerfile without the ARG ignores it.
+          build-args: |
+            OS_PATCH_DATE=${{ steps.patch-date.outputs.date }}
 
       # Trivy, on every build. Findings of every severity go to the Security
       # tab, where repo-agent's weekly digest reads them. A pull request also
