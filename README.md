@@ -349,6 +349,18 @@ A **pull request fails** on `scan-fail-on` severities (CRITICAL and HIGH by defa
 
 The caller grants `security-events: write` for the upload. Without it the upload warns and the gate still works. A multi-platform build that doesn't push isn't scanned, since it can't be loaded locally.
 
+**Fixes published after a layer was cached still get in, if the Dockerfile asks.** The layer cache is keyed by instruction, so an `apt-get upgrade` or `apk upgrade` step is reused until its own line or the base digest changes, and a fix published since then is missing: Trivy fails the PR on a "fixable" finding the upgrade step was written to fix (market-agent's curl and libssl3, October 2026). So every build passes `OS_PATCH_DATE`, today's UTC date, as a build arg. A build arg invalidates the cache only from where a stage declares it, so declare it directly before the upgrade step:
+
+```dockerfile
+FROM base AS runtime
+ARG OS_PATCH_DATE
+RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+That step, and everything after it, rebuilds once a day; everything above it stays cached. A Dockerfile that doesn't declare the ARG builds exactly as before.
+
 ### Docker inputs
 
 | Input | Default | Description |
