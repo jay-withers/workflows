@@ -174,6 +174,7 @@ jobs:
 | `client-id` | `""` | Overrides the environment's `AZURE_CLIENT_ID` |
 | `tenant-id` | `""` | Overrides the environment's `AZURE_TENANT_ID` |
 | `subscription-id` | `""` | Overrides the environment's `AZURE_SUBSCRIPTION_ID` |
+| `app` | repo name | Recorded as `App` in the deploy event |
 | `runs-on` | `ubuntu-latest` | Runner label |
 
 Notes:
@@ -187,6 +188,7 @@ Notes:
   - `smoke` exits non-zero unless `IMAGE_TAG` is what's running. For an app, poll its default FQDN until a `/healthz`-style endpoint reports `IMAGE_TAG` and readiness passes, allowing for a cold start. For a job, check its configured image; don't start it, since running a job has side effects.
   - `smoke` runs with `SMOKE_PHASE=release` after the deploy and `SMOKE_PHASE=rollback` after a rollback, so it can skip on a rollback what an older image may predate, or what only slows restoring service (starting a self-check run of each job, for example).
   - Rolling back redeploys an image, nothing else. A release whose data or schema change the previous version can't read must not rely on it.
+- **Every run records a deploy event**, whatever its outcome: one row in the platform's `Deployments_CL` table (azure-container-apps), posted through the Logs Ingestion API with the run's own Azure login. Columns: `Repo`, `App`, `Environment`, `Version`, `PreviousVersion` (the recorded live tag), `Outcome` (`success`, `untested` when there's no smoke target, `rolled_back` or `failed`), `Trigger` (`renovate` when the released commit is Renovate's, else `manual`), `CommitSha`, `RunUrl` and `LeadTimeSec` (commit to live). It needs `EVENTS_INGESTION_ENDPOINT` and `EVENTS_DCR_IMMUTABLE_ID` on the environment and `Monitoring Metrics Publisher` on the events rule, all set by github-repos; without the variables the step is skipped with a notice. A post that fails turns the run red, after the issue step, so it never reads as a failed deploy. The Environments page needs no extra step: a job running in a GitHub environment already records a deployment there.
 - **A failed deploy opens an issue** labelled `deploy-failed`, @-mentioning the repo owner and linking the run; a repeat failure comments on it and the next success closes it. GitHub emails a failed run only to whoever triggered it, and Renovate's auto-merges trigger most deploys, so without this nobody hears. The caller must grant `issues: write` (and `cd-tag` too, when it calls `cd-publish`); without it the step only warns.
 
 ## Pre-commit CI
