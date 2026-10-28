@@ -337,6 +337,7 @@ jobs:
           PREVIOUS: ${{ steps.live.outputs.tag }}
           RESULT: ${{ steps.deploy.outputs.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EVENT: ${{ github.event_name }}
         run: |
           if [ -z "$ENDPOINT" ] || [ -z "$DCR_ID" ]; then
             echo "::notice::EVENTS_INGESTION_ENDPOINT or EVENTS_DCR_IMMUTABLE_ID is not set on the '$TF_ENVIRONMENT' environment, so this deploy is not recorded."
@@ -351,12 +352,21 @@ jobs:
           # The checkout is the released tag, so HEAD is the commit that went
           # live. Renovate's auto-merges are authored by its bot; anything else
           # was a person. Lead time runs from that commit to now.
+          #
+          # A run started by hand (cd-publish's workflow_dispatch) redeploys an
+          # existing tag: its commit's author didn't trigger it and its commit
+          # time says nothing about lead time, so it is a `redeploy` with no
+          # lead time rather than skewing either.
           sha="" trigger="manual" lead=""
           if sha="$(git rev-parse HEAD 2>/dev/null)"; then
-            case "$(git log -1 --format=%an)" in
-              renovate*) trigger="renovate" ;;
-            esac
-            lead=$(( $(date +%s) - $(git log -1 --format=%ct) ))
+            if [ "$EVENT" = "workflow_dispatch" ]; then
+              trigger="redeploy"
+            else
+              case "$(git log -1 --format=%an)" in
+                renovate*) trigger="renovate" ;;
+              esac
+              lead=$(( $(date +%s) - $(git log -1 --format=%ct) ))
+            fi
           fi
 
           row="$(jq -cn \
