@@ -26,6 +26,14 @@ name: Container Apps deploy
 # a failed deploy or smoke test rolls back to the recorded tag before failing
 # the run. Like the deploy itself, what "healthy" means stays in the caller's
 # Makefile. A repo without the target deploys exactly as before.
+#
+# Every run, whatever its outcome, then writes one row to the platform's
+# `Deployments_CL` table (azure-container-apps) through the Logs Ingestion API,
+# once the environment carries EVENTS_INGESTION_ENDPOINT and
+# EVENTS_DCR_IMMUTABLE_ID (set by github-repos, alongside the Monitoring
+# Metrics Publisher grant that lets this identity send). Until then the step
+# is skipped with a notice. The Environments page needs nothing extra: a job
+# that runs in a GitHub environment already records a deployment there.
 
 on:
   workflow_call:
@@ -76,6 +84,13 @@ on:
         default: ""
       subscription-id:
         description: Overrides the environment's AZURE_SUBSCRIPTION_ID variable.
+        type: string
+        default: ""
+      app:
+        description: >-
+          Name recorded as `App` in the deploy event. Defaults to the
+          repository name; set it where a repo deploys more than one thing
+          from separate callers.
         type: string
         default: ""
       runs-on:
@@ -229,8 +244,10 @@ jobs:
 
           if deploy "$VERSION" release; then
             if [ "$SMOKE" = true ]; then
+              echo "result=success" >> "$GITHUB_OUTPUT"
               echo "Deployed and smoke-tested \`$VERSION\` on \`$TF_ENVIRONMENT\`." >> "$GITHUB_STEP_SUMMARY"
             else
+              echo "result=untested" >> "$GITHUB_OUTPUT"
               echo "Deployed \`$VERSION\` to \`$TF_ENVIRONMENT\` (no smoke test)." >> "$GITHUB_STEP_SUMMARY"
             fi
             exit 0
@@ -240,6 +257,7 @@ jobs:
           if [ "$SMOKE" != true ] || [ "$ROLLBACK" != true ] || [ -z "$PREVIOUS" ] || [ "$PREVIOUS" = "$VERSION" ]; then
             echo "Deploying \`$VERSION\` to \`$TF_ENVIRONMENT\` failed, with nothing to roll back to." >> "$GITHUB_STEP_SUMMARY"
             echo "outcome=not rolled back" >> "$GITHUB_OUTPUT"
+            echo "result=failed" >> "$GITHUB_OUTPUT"
             exit 1
           fi
 
@@ -249,11 +267,13 @@ jobs:
             echo "::error::Rolled back to $PREVIOUS, which passed its smoke test."
             echo "Deploying \`$VERSION\` failed; rolled back to \`$PREVIOUS\`, which is live and healthy." >> "$GITHUB_STEP_SUMMARY"
             echo "outcome=rolled back to \`$PREVIOUS\`, which is live and healthy" >> "$GITHUB_OUTPUT"
+            echo "result=rolled_back" >> "$GITHUB_OUTPUT"
           else
             echo "::endgroup::"
             echo "::error::Rolling back to $PREVIOUS failed too. $TF_ENVIRONMENT may be down."
             echo "Deploying \`$VERSION\` failed, and so did rolling back to \`$PREVIOUS\`. \`$TF_ENVIRONMENT\` may be down." >> "$GITHUB_STEP_SUMMARY"
             echo "outcome=rolling back to \`$PREVIOUS\` failed too, so it may be down" >> "$GITHUB_OUTPUT"
+            echo "result=failed" >> "$GITHUB_OUTPUT"
           fi
           exit 1
 
@@ -298,3 +318,76 @@ jobs:
           elif [ -n "$existing" ]; then
             gh issue close "$existing" -R "$REPOSITORY" --comment "Recovered: $RUN_URL (\`$REF\`)" > /dev/null
           fi
+
+      # One row in the platform's Deployments_CL per run, success or not, so
+      # deploy history is queryable rather than living only in step summaries.
+      # Runs last, after the issue step, so a failed post can't change what
+      # that step reports about the deploy itself. A failed post fails the
+      # job loudly rather than leaving a silent gap in the history: the job
+      # is otherwise green, so the red step is the whole signal.
+      - name: Record the deploy event
+        if: always() && github.event_name != 'pull_request' && job.status != 'cancelled'
+        env:
+          ENDPOINT: ${{ vars.EVENTS_INGESTION_ENDPOINT }}
+          DCR_ID: ${{ vars.EVENTS_DCR_IMMUTABLE_ID }}
+          REPOSITORY: ${{ github.repository }}
+          APP: ${{ inputs.app }}
+          TF_ENVIRONMENT: ${{ inputs.environment }}
+          VERSION: ${{ inputs.version }}
+          PREVIOUS: ${{ steps.live.outputs.tag }}
+          RESULT: ${{ steps.deploy.outputs.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$ENDPOINT" ] || [ -z "$DCR_ID" ]; then
+            echo "::notice::EVENTS_INGESTION_ENDPOINT or EVENTS_DCR_IMMUTABLE_ID is not set on the '$TF_ENVIRONMENT' environment, so this deploy is not recorded."
+            exit 0
+          fi
+
+          repo="${REPOSITORY#*/}"
+          # A deploy step that never ran (Azure login failed, say) left no
+          # result: nothing new went live, which is a failed deploy.
+          outcome="${RESULT:-failed}"
+
+          # The checkout is the released tag, so HEAD is the commit that went
+          # live. Renovate's auto-merges are authored by its bot; anything else
+          # was a person. Lead time runs from that commit to now.
+          sha="" trigger="manual" lead=""
+          if sha="$(git rev-parse HEAD 2>/dev/null)"; then
+            case "$(git log -1 --format=%an)" in
+              renovate*) trigger="renovate" ;;
+            esac
+            lead=$(( $(date +%s) - $(git log -1 --format=%ct) ))
+          fi
+
+          row="$(jq -cn \
+            --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg repo "$repo" \
+            --arg app "${APP:-$repo}" \
+            --arg env "$TF_ENVIRONMENT" \
+            --arg version "$VERSION" \
+            --arg previous "$PREVIOUS" \
+            --arg outcome "$outcome" \
+            --arg trigger "$trigger" \
+            --arg sha "$sha" \
+            --arg run "$RUN_URL" \
+            --arg lead "$lead" \
+            '[{TimeGenerated: $time, Repo: $repo, App: $app, Environment: $env,
+               Version: $version, PreviousVersion: $previous, Outcome: $outcome,
+               Trigger: $trigger, CommitSha: $sha, RunUrl: $run,
+               LeadTimeSec: ($lead | if . == "" then null else tonumber end)}]')"
+          echo "$row"
+
+          if ! token="$(az account get-access-token --resource https://monitor.azure.com --query accessToken -o tsv)"; then
+            echo "::error::No Azure token to record the deploy event with (did Azure login succeed?)."
+            exit 1
+          fi
+          status="$(curl -sS -o /tmp/ingest.out -w '%{http_code}' -X POST \
+            "${ENDPOINT%/}/dataCollectionRules/${DCR_ID}/streams/Custom-Deployments_CL?api-version=2023-01-01" \
+            -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
+            --data "$row")"
+          # 204 is the only success: the API accepts the batch whole or not at all.
+          if [ "$status" != "204" ]; then
+            echo "::error::Recording the deploy event failed with HTTP $status: $(cat /tmp/ingest.out)"
+            exit 1
+          fi
+          echo "Recorded \`$outcome\` for \`$VERSION\` in Deployments_CL." >> "$GITHUB_STEP_SUMMARY"
