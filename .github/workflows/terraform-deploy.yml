@@ -20,6 +20,11 @@ name: Terraform deploy
 # `<repo prefix>:environment:<environment>` for plans and applies alike, so one
 # federated credential per environment covers both.
 #
+# A configuration that also uses the github provider (github-repos) reads its
+# token from the TF_GITHUB_TOKEN secret on that same environment, never a
+# repository secret: a repository secret reaches a workflow run from any
+# branch, an environment secret only the jobs its branch rules let in.
+#
 # This is deliberately separate from terraform.yml, which stays credential-free:
 # a plan needs an identity with read on everything the configuration touches
 # and only succeeds once its dependencies exist, so only repos that meet both
@@ -35,6 +40,22 @@ on:
           `environments/<environment>.tfvars` inside `directory`.
         type: string
         default: dev
+      github-environment:
+        description: >-
+          GitHub environment the job runs in, when it differs from
+          `environment`: a configuration whose plans and applies log in as
+          different identities runs each in its own GitHub environment. Empty
+          uses `environment`.
+        type: string
+        default: ""
+      environment-files:
+        description: >-
+          Pass `backends/<environment>.hcl` and
+          `environments/<environment>.tfvars`. False for a root with a single
+          deployment, whose backend block and terraform.tfvars are complete on
+          their own.
+        type: boolean
+        default: true
       directory:
         description: Root-module directory, relative to the repository root.
         type: string
@@ -66,6 +87,16 @@ on:
         description: Runner label.
         type: string
         default: ubuntu-latest
+    # Declared so the reference below lints; callers pass nothing. GitHub
+    # gives a job that declares `environment:` that environment's secret of
+    # this name in preference to anything passed in.
+    secrets:
+      TF_GITHUB_TOKEN:
+        description: >-
+          Set as a secret on the GitHub environment, not passed: the github
+          provider's token, for a configuration that uses it. Unset for any
+          other.
+        required: false
     outputs:
       has-changes:
         description: '"true" when the plan had changes.'
@@ -75,7 +106,7 @@ jobs:
   deploy:
     name: ${{ inputs.apply && 'Apply' || 'Plan' }} (${{ inputs.environment }})
     runs-on: ${{ inputs.runs-on }}
-    environment: ${{ inputs.environment }}
+    environment: ${{ inputs.github-environment || inputs.environment }}
     # No permissions block, deliberately: the job inherits the caller's grant.
     # A PR caller grants `pull-requests: write` for the plan comment and an
     # apply caller doesn't, and a job that *requested* it here would refuse to
@@ -112,7 +143,7 @@ jobs:
       - name: Check Azure settings
         working-directory: .
         env:
-          INPUT_ENVIRONMENT: ${{ inputs.environment }}
+          INPUT_ENVIRONMENT: ${{ inputs.github-environment || inputs.environment }}
         run: |
           for v in ARM_CLIENT_ID ARM_TENANT_ID ARM_SUBSCRIPTION_ID; do
             if [ -z "${!v}" ]; then
@@ -148,7 +179,13 @@ jobs:
       - name: Terraform init
         env:
           TF_ENVIRONMENT: ${{ inputs.environment }}
-        run: terraform init -input=false -backend-config="backends/${TF_ENVIRONMENT}.hcl"
+          ENVIRONMENT_FILES: ${{ inputs.environment-files }}
+        run: |
+          if [ "$ENVIRONMENT_FILES" = "true" ]; then
+            terraform init -input=false -backend-config="backends/${TF_ENVIRONMENT}.hcl"
+          else
+            terraform init -input=false
+          fi
 
       # -detailed-exitcode: 0 is no changes, 2 is changes, 1 is an error. The
       # lock timeout covers a PR plan overlapping an apply on main.
@@ -156,10 +193,16 @@ jobs:
         id: plan
         env:
           TF_ENVIRONMENT: ${{ inputs.environment }}
+          ENVIRONMENT_FILES: ${{ inputs.environment-files }}
+          GITHUB_TOKEN: ${{ secrets.TF_GITHUB_TOKEN }}
         run: |
+          var_file=()
+          if [ "$ENVIRONMENT_FILES" = "true" ]; then
+            var_file=(-var-file="environments/${TF_ENVIRONMENT}.tfvars")
+          fi
           set +e
           terraform plan -input=false -no-color -lock-timeout=5m \
-            -var-file="environments/${TF_ENVIRONMENT}.tfvars" \
+            "${var_file[@]}" \
             -out=tfplan -detailed-exitcode
           code=$?
           set -e
@@ -258,6 +301,8 @@ jobs:
 
       - name: Terraform apply
         if: inputs.apply && steps.plan.outputs.has-changes == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.TF_GITHUB_TOKEN }}
         run: terraform apply -input=false -no-color tfplan
 
       # Infrastructure changes are applied by a human, not by a merge: the
