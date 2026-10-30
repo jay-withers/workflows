@@ -100,6 +100,14 @@ on:
           held as a `deploy-pending` issue) or `all`.
         type: string
         default: renovate
+      run-workflow:
+        description: >-
+          The caller's workflow to run by hand to deploy a held release, as the
+          `deploy-pending` issue names it. github.workflow can't tell: inside
+          a called workflow it is the top-level caller (cd-tag), which takes no
+          version.
+        type: string
+        default: cd-publish
       app:
         description: >-
           Name recorded as `App` in the deploy event. Defaults to the
@@ -249,7 +257,7 @@ jobs:
           OWNER: ${{ github.repository_owner }}
           EVENT: ${{ github.event_name }}
           ATTEMPT: ${{ github.run_attempt }}
-          WORKFLOW: ${{ github.workflow }}
+          WORKFLOW: ${{ inputs.run-workflow }}
           DEPLOY_ON_MERGE: ${{ inputs.deploy-on-merge }}
           INPUT_VERSION: ${{ inputs.version }}
           MAJORS: ${{ steps.majors.outputs.found }}
