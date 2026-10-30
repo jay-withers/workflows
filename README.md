@@ -139,7 +139,7 @@ Notes:
 - **A failed apply opens an issue** labelled `deploy-failed`, as Container Apps deploy does (one per directory and environment, closed by the next successful apply). Apply callers must grant `issues: write`; without it the step only warns.
 - The plan is also written to the run's job summary, truncated at 60,000 bytes like the comment. The job log always has the full plan.
 - Plan output is as public as the repo's Actions logs already are. Terraform masks `sensitive` values in both.
-- **A configuration using the github provider** gets `GITHUB_TOKEN` from a `TF_GITHUB_TOKEN` secret on the job's GitHub environment, for plan and apply. Set it on the environment, never as a repository secret, which any branch's run could read. Callers pass nothing; without it the variable is empty.
+- **A configuration using the github provider** gets `GITHUB_TOKEN` from a `TF_GITHUB_TOKEN` secret on the job's GitHub environment, for plan and apply. Set it on the environment, never as a repository secret, which any branch's run could read. The calling job must pass `secrets: inherit`: without it the called job sees no secrets, its own environment's included, and the provider runs unauthenticated (`403 API rate limit of 60`).
 - **Separate plan and apply identities** (github-repos): PR plans run in an environment holding a read-only identity and token, and the push and manual runs pass `github-environment` naming one with a deployment branch policy of `main` only, which holds the privileged ones. Pending and failed issues stay keyed on `environment`, so they don't split in two.
 
 ## Container Apps deploy
