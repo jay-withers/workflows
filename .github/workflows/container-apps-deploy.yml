@@ -34,6 +34,13 @@ name: Container Apps deploy
 # Metrics Publisher grant that lets this identity send). Until then the step
 # is skipped with a notice. The Environments page needs nothing extra: a job
 # that runs in a GitHub environment already records a deployment there.
+#
+# Only Renovate's merges deploy themselves. A release whose commit a person
+# merged is held: the `gate` job opens a `deploy-pending` issue instead, and
+# running the caller by hand (cd-publish's workflow_dispatch) with that tag
+# deploys it and closes the issue. Renovate's updates are low-risk and
+# frequent, so they don't wait; a person's change goes live when they choose.
+# `deploy-on-merge: all` turns the hold off.
 
 on:
   workflow_call:
@@ -86,6 +93,13 @@ on:
         description: Overrides the environment's AZURE_SUBSCRIPTION_ID variable.
         type: string
         default: ""
+      deploy-on-merge:
+        description: >-
+          Which merges deploy without a person running the workflow:
+          `renovate` (releases whose commit Renovate authored; any other is
+          held as a `deploy-pending` issue) or `all`.
+        type: string
+        default: renovate
       app:
         description: >-
           Name recorded as `App` in the deploy event. Defaults to the
@@ -99,8 +113,179 @@ on:
         default: ubuntu-latest
 
 jobs:
+  # Decides whether this run deploys. A run started by hand, or re-run, is
+  # someone choosing to deploy, so it always does. A merge deploys only when
+  # Renovate authored the released commit, its lock files carry no major
+  # update, and nothing is already held: a release carries every commit before
+  # it, so a release on top of a held one would ship the held change too, and
+  # is held with it. A hold opens
+  # (or moves to the newer tag) one `deploy-pending` issue per environment and
+  # app. It fails the run if it can't, since a hold nobody hears about would
+  # never deploy. Needs `issues: write` and `contents: read`.
+  gate:
+    name: Gate (${{ inputs.environment }})
+    runs-on: ${{ inputs.runs-on }}
+    concurrency:
+      group: container-apps-deploy-gate-${{ github.repository }}-${{ inputs.environment }}-${{ inputs.app }}
+      cancel-in-progress: false
+    outputs:
+      deploy: ${{ steps.gate.outputs.deploy }}
+      resolves: ${{ steps.gate.outputs.resolves }}
+    steps:
+      # Only a merge's gate reads the code: a run by hand deploys regardless.
+      - name: Checkout
+        if: github.event_name == 'push' && github.run_attempt == 1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.version }}
+          fetch-depth: 0
+
+      # Renovate auto-merges majors, and most Python majors don't even arrive
+      # as one: pyproject sets only lower bounds (pydantic>=2.9), so a new
+      # major lands inside a "Lock file maintenance" PR that Renovate never
+      # calls major. So the lock files decide: a package in any tracked
+      # uv.lock whose major version (minor, below 1.0) rose since the
+      # previous release holds the deploy, Renovate's or not. Tests and the
+      # smoke test still run; this only means a person picks the moment.
+      - name: Find major updates
+        id: majors
+        if: github.event_name == 'push' && github.run_attempt == 1
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          version="${INPUT_VERSION#refs/tags/}"
+          if ! prev="$(git describe --tags --abbrev=0 "$version^" 2>/dev/null)"; then
+            echo "No previous release, so nothing to compare."
+            exit 0
+          fi
+          # The Python is single-quoted on purpose: the shell expands none of it.
+          # shellcheck disable=SC2016
+          git ls-files '*uv.lock' | python3 -c '
+          import re, subprocess, sys, tomllib
+
+          prev = sys.argv[1]
+
+          def key(v):
+              # The part of a version whose rise is breaking: 2.x -> (2,), 0.17.x -> (0, 17).
+              m = re.match(r"\d+(?:\.\d+)*", v)
+              parts = tuple(int(p) for p in m.group().split(".")) if m else (0,)
+              return parts[:1] if parts[0] or len(parts) == 1 else parts[:2]
+
+          def versions(text):
+              out = {}
+              for pkg in tomllib.loads(text).get("package", []):
+                  src = pkg.get("source", {})
+                  if "editable" in src or "virtual" in src or "version" not in pkg:
+                      continue  # the project itself
+                  v = pkg["version"]
+                  if pkg["name"] not in out or key(v) > key(out[pkg["name"]]):
+                      out[pkg["name"]] = v
+              return out
+
+          for path in sys.stdin.read().split():
+              old = subprocess.run(["git", "show", f"{prev}:{path}"], capture_output=True, text=True)
+              if old.returncode:
+                  continue  # new lock file: nothing to compare
+              before, after = versions(old.stdout), versions(open(path).read())
+              for name in sorted(before.keys() & after.keys()):
+                  if key(after[name]) > key(before[name]):
+                      print(f"- `{name}` {before[name]} → {after[name]} (`{path}`)")
+          ' "$prev" > "$RUNNER_TEMP/majors.md"
+          if [ -s "$RUNNER_TEMP/majors.md" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "Major updates since \`$prev\`:"
+            cat "$RUNNER_TEMP/majors.md"
+          fi
+
+      - name: Hold or deploy
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          EVENT: ${{ github.event_name }}
+          ATTEMPT: ${{ github.run_attempt }}
+          WORKFLOW: ${{ github.workflow }}
+          DEPLOY_ON_MERGE: ${{ inputs.deploy-on-merge }}
+          INPUT_VERSION: ${{ inputs.version }}
+          MAJORS: ${{ steps.majors.outputs.found }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TITLE: "Deploy to ${{ inputs.environment }} pending${{ inputs.app && format(' ({0})', inputs.app) || '' }}"
+          MARKER: "<!-- deploy-pending:container-apps-deploy:${{ inputs.environment }}:${{ inputs.app }} -->"
+        run: |
+          case "$DEPLOY_ON_MERGE" in
+            renovate|all) ;;
+            *) echo "::error::inputs.deploy-on-merge must be 'renovate' or 'all'."; exit 1 ;;
+          esac
+          # The deploy job refuses pull requests itself.
+          if [ "$EVENT" = "pull_request" ] || [ "$EVENT" = "pull_request_target" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          version="${INPUT_VERSION#refs/tags/}"
+          label=deploy-pending
+          # "<number> <held version>" of the open issue, if any.
+          existing="$(gh issue list -R "$REPOSITORY" --label "$label" --state open \
+            --json number,body --jq ".[] | select(.body | contains(\"$MARKER\"))
+              | \"\(.number) \((.body | capture(\"<!-- version:(?<v>[^ ]+) -->\").v) // \"\")\"" | head -1)"
+          number="${existing%% *}"
+          held="${existing#* }"
+
+          if [ "$EVENT" = "workflow_dispatch" ] || [ "$ATTEMPT" -gt 1 ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            # Deploying the held tag resolves the issue once it succeeds.
+            if [ -n "$number" ] && [ "$held" = "$version" ]; then
+              echo "resolves=$number" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          author="$(git log -1 --format=%an)"
+          reason=""
+          if [ "$DEPLOY_ON_MERGE" != all ]; then
+            case "$author" in
+              renovate*) ;;
+              *) reason="$author merged it, and a person's change goes live when they choose." ;;
+            esac
+            if [ "$MAJORS" = true ]; then
+              reason="${reason:+$reason }It carries major updates, which can break what tests don't cover."
+            fi
+            if [ -n "$number" ] && [ "$held" != "$version" ]; then
+              reason="${reason:+$reason }It includes \`$held\`, held before it, so everything since waits with it."
+            fi
+          fi
+          if [ -z "$reason" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "deploy=false" >> "$GITHUB_OUTPUT"
+          body="$RUNNER_TEMP/pending.md"
+          {
+            echo "$MARKER"
+            echo "<!-- version:$version -->"
+            echo "@$OWNER \`$version\` is published but not deployed. $reason"
+            echo
+            if [ "$MAJORS" = true ]; then
+              cat "$RUNNER_TEMP/majors.md"
+              echo
+            fi
+            echo "Deploy it by running **$WORKFLOW** from the Actions tab (*Run workflow*) with version \`$version\`. This issue closes itself once that deploy succeeds. Held by: $RUN_URL"
+          } > "$body"
+          gh label create "$label" -R "$REPOSITORY" --color FBCA04 \
+            --description "A release on main waiting to be deployed. Closed by deploying it." 2>/dev/null || true
+          if [ -n "$number" ]; then
+            gh issue edit "$number" -R "$REPOSITORY" --body-file "$body" > /dev/null
+          else
+            gh issue create -R "$REPOSITORY" --title "$TITLE" --label "$label" --body-file "$body" > /dev/null
+          fi
+          echo "Held \`$version\` for a manual deploy. $reason Run **$WORKFLOW** with it to deploy." >> "$GITHUB_STEP_SUMMARY"
+
   deploy:
     name: Deploy (${{ inputs.environment }})
+    needs: gate
+    if: needs.gate.outputs.deploy == 'true'
     runs-on: ${{ inputs.runs-on }}
     environment: ${{ inputs.environment }}
     # No permissions block, deliberately: the job inherits the caller's grant,
@@ -277,6 +462,18 @@ jobs:
           fi
           exit 1
 
+      - name: Close the pending deploy issue
+        if: needs.gate.outputs.resolves != '' && (steps.deploy.outputs.result == 'success' || steps.deploy.outputs.result == 'untested')
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          NUMBER: ${{ needs.gate.outputs.resolves }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          gh issue close "$NUMBER" -R "$REPOSITORY" --comment "Deployed: $RUN_URL (\`$VERSION\`)" > /dev/null
+
       # A failed deploy opens an issue, because GitHub emails a failed run only
       # to whoever triggered it, and most of these are triggered by
       # Renovate's auto-merge, so nobody would hear. The issue @-mentions the
@@ -338,6 +535,7 @@ jobs:
           RESULT: ${{ steps.deploy.outputs.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           EVENT: ${{ github.event_name }}
+          RESOLVES: ${{ needs.gate.outputs.resolves }}
         run: |
           if [ -z "$ENDPOINT" ] || [ -z "$DCR_ID" ]; then
             echo "::notice::EVENTS_INGESTION_ENDPOINT or EVENTS_DCR_IMMUTABLE_ID is not set on the '$TF_ENVIRONMENT' environment, so this deploy is not recorded."
@@ -356,10 +554,12 @@ jobs:
           # A run started by hand (cd-publish's workflow_dispatch) redeploys an
           # existing tag: its commit's author didn't trigger it and its commit
           # time says nothing about lead time, so it is a `redeploy` with no
-          # lead time rather than skewing either.
+          # lead time rather than skewing either. Unless it deploys a held
+          # release (RESOLVES): that is a person's merge going live, `manual`,
+          # and the hold counts towards its lead time.
           sha="" trigger="manual" lead=""
           if sha="$(git rev-parse HEAD 2>/dev/null)"; then
-            if [ "$EVENT" = "workflow_dispatch" ]; then
+            if [ "$EVENT" = "workflow_dispatch" ] && [ -z "$RESOLVES" ]; then
               trigger="redeploy"
             else
               case "$(git log -1 --format=%an)" in
