@@ -87,16 +87,10 @@ on:
         description: Runner label.
         type: string
         default: ubuntu-latest
-    # Declared so the reference below lints; callers pass nothing. GitHub
-    # gives a job that declares `environment:` that environment's secret of
-    # this name in preference to anything passed in.
-    secrets:
-      TF_GITHUB_TOKEN:
-        description: >-
-          Set as a secret on the GitHub environment, not passed: the github
-          provider's token, for a configuration that uses it. Unset for any
-          other.
-        required: false
+    # No `secrets:` block, deliberately. TF_GITHUB_TOKEN is read from the
+    # job's GitHub environment, and declaring it here made `secrets.` resolve
+    # to the caller's (empty) value instead, so the github provider ran
+    # unauthenticated into the 60-requests-an-hour limit.
     outputs:
       has-changes:
         description: '"true" when the plan had changes.'
