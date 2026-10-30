@@ -175,6 +175,7 @@ jobs:
 | `tenant-id` | `""` | Overrides the environment's `AZURE_TENANT_ID` |
 | `subscription-id` | `""` | Overrides the environment's `AZURE_SUBSCRIPTION_ID` |
 | `deploy-on-merge` | `renovate` | Which merges deploy without a person: `renovate` (Renovate's releases with no major update; the rest are held) or `all` |
+| `run-workflow` | `cd-publish` | The workflow the `deploy-pending` issue says to run by hand with the tag |
 | `app` | repo name | Recorded as `App` in the deploy event |
 | `runs-on` | `ubuntu-latest` | Runner label |
 
