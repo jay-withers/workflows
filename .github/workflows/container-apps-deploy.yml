@@ -132,7 +132,7 @@ jobs:
       deploy: ${{ steps.gate.outputs.deploy }}
       resolves: ${{ steps.gate.outputs.resolves }}
     steps:
-      # The same check as the deploy job's, before this job checks anything out.
+      # The same check as the deploy job's, before this job opens any issue.
       - name: Validate trusted deploy context and version ref
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -159,14 +159,6 @@ jobs:
               ;;
           esac
 
-      # Only a merge's gate reads the code: a run by hand deploys regardless.
-      - name: Checkout
-        if: github.event_name == 'push' && github.run_attempt == 1
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ inputs.version }}
-          fetch-depth: 0
-
       # Renovate auto-merges majors, and most Python majors don't even arrive
       # as one: pyproject sets only lower bounds (pydantic>=2.9), so a new
       # major lands inside a "Lock file maintenance" PR that Renovate never
@@ -174,23 +166,48 @@ jobs:
       # uv.lock whose major version (minor, below 1.0) rose since the
       # previous release holds the deploy, Renovate's or not. Tests and the
       # smoke test still run; this only means a person picks the moment.
+      #
+      # Only a merge's gate looks: a run by hand deploys regardless. It reads
+      # the lock files through the API rather than checking the release out,
+      # so no code from the repo ever lands on this runner.
       - name: Find major updates
         id: majors
         if: github.event_name == 'push' && github.run_attempt == 1
         env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           version="${INPUT_VERSION#refs/tags/}"
-          if ! prev="$(git describe --tags --abbrev=0 "$version^" 2>/dev/null)"; then
+          # Any API error fails the step rather than skipping the check: a
+          # check that silently passed would deploy what it exists to hold.
+          # The release before this one, as release.yml tags them (vX.Y.Z).
+          tags="$(gh api "repos/$REPOSITORY/git/matching-refs/tags/v" --paginate --jq '.[].ref | ltrimstr("refs/tags/")')"
+          prev="$(printf '%s\n%s\n' "$tags" "$version" | sort -uV | grep -B1 -Fx "$version" | grep -vFx "$version" || true)"
+          if [ -z "$prev" ]; then
             echo "No previous release, so nothing to compare."
             exit 0
           fi
-          # The Python is single-quoted on purpose: the shell expands none of it.
-          # shellcheck disable=SC2016
-          git ls-files '*uv.lock' | python3 -c '
-          import re, subprocess, sys, tomllib
 
-          prev = sys.argv[1]
+          lock_files() {
+            gh api "repos/$REPOSITORY/git/trees/$1?recursive=1" \
+              --jq '.tree[] | select(.type == "blob" and (.path | test("(^|/)uv\\.lock$"))) | .path'
+          }
+          locks="$RUNNER_TEMP/locks"
+          # A lock file new in this release has nothing to compare against.
+          for ref in "$prev" "$version"; do
+            files="$(lock_files "$ref")"
+            for path in $files; do
+              mkdir -p "$locks/$ref/$(dirname "$path")"
+              gh api -H "Accept: application/vnd.github.raw" "repos/$REPOSITORY/contents/$path?ref=$ref" > "$locks/$ref/$path"
+            done
+          done
+
+          # shellcheck disable=SC2016 # Python, not shell
+          python3 -c '
+          import pathlib, re, sys, tomllib
+
+          old_root, new_root = map(pathlib.Path, sys.argv[1:])
 
           def key(v):
               # The part of a version whose rise is breaking: 2.x -> (2,), 0.17.x -> (0, 17).
@@ -198,9 +215,9 @@ jobs:
               parts = tuple(int(p) for p in m.group().split(".")) if m else (0,)
               return parts[:1] if parts[0] or len(parts) == 1 else parts[:2]
 
-          def versions(text):
+          def versions(path):
               out = {}
-              for pkg in tomllib.loads(text).get("package", []):
+              for pkg in tomllib.loads(path.read_text()).get("package", []):
                   src = pkg.get("source", {})
                   if "editable" in src or "virtual" in src or "version" not in pkg:
                       continue  # the project itself
@@ -209,15 +226,15 @@ jobs:
                       out[pkg["name"]] = v
               return out
 
-          for path in sys.stdin.read().split():
-              old = subprocess.run(["git", "show", f"{prev}:{path}"], capture_output=True, text=True)
-              if old.returncode:
-                  continue  # new lock file: nothing to compare
-              before, after = versions(old.stdout), versions(open(path).read())
+          for new in sorted(new_root.rglob("uv.lock")):
+              path = new.relative_to(new_root)
+              if not (old_root / path).exists():
+                  continue
+              before, after = versions(old_root / path), versions(new)
               for name in sorted(before.keys() & after.keys()):
                   if key(after[name]) > key(before[name]):
                       print(f"- `{name}` {before[name]} → {after[name]} (`{path}`)")
-          ' "$prev" > "$RUNNER_TEMP/majors.md"
+          ' "$locks/$prev" "$locks/$version" > "$RUNNER_TEMP/majors.md"
           if [ -s "$RUNNER_TEMP/majors.md" ]; then
             echo "found=true" >> "$GITHUB_OUTPUT"
             echo "Major updates since \`$prev\`:"
@@ -262,7 +279,7 @@ jobs:
             exit 0
           fi
 
-          author="$(git log -1 --format=%an)"
+          author="$(gh api "repos/$REPOSITORY/commits/$version" --jq .commit.author.name)"
           reason=""
           if [ "$DEPLOY_ON_MERGE" != all ]; then
             case "$author" in
