@@ -132,6 +132,33 @@ jobs:
       deploy: ${{ steps.gate.outputs.deploy }}
       resolves: ${{ steps.gate.outputs.resolves }}
     steps:
+      # The same check as the deploy job's, before this job checks anything out.
+      - name: Validate trusted deploy context and version ref
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF_VALUE: ${{ github.ref }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "pull_request_target" ]; then
+            echo "::error::Deploying is not allowed from pull request events."
+            exit 1
+          fi
+
+          # Only allow deploying explicit tags (refs/tags/*) or release-like tags (vX.Y.Z...).
+          case "$INPUT_VERSION" in
+            refs/tags/*) ;;
+            v[0-9]*)
+              if ! printf '%s' "$INPUT_VERSION" | grep -Eq '^v[0-9]+(\.[0-9]+){1,2}([.-][0-9A-Za-z._-]+)?$'; then
+                echo "::error::inputs.version must be a valid release tag."
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::inputs.version must be a tag ref (refs/tags/*) or release tag (v*)."
+              exit 1
+              ;;
+          esac
+
       # Only a merge's gate reads the code: a run by hand deploys regardless.
       - name: Checkout
         if: github.event_name == 'push' && github.run_attempt == 1
@@ -217,12 +244,6 @@ jobs:
             renovate|all) ;;
             *) echo "::error::inputs.deploy-on-merge must be 'renovate' or 'all'."; exit 1 ;;
           esac
-          # The deploy job refuses pull requests itself.
-          if [ "$EVENT" = "pull_request" ] || [ "$EVENT" = "pull_request_target" ]; then
-            echo "deploy=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
           version="${INPUT_VERSION#refs/tags/}"
           label=deploy-pending
           # "<number> <held version>" of the open issue, if any.
