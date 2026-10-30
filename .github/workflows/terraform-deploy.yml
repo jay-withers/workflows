@@ -87,10 +87,10 @@ on:
         description: Runner label.
         type: string
         default: ubuntu-latest
-    # No `secrets:` block, deliberately. TF_GITHUB_TOKEN is read from the
-    # job's GitHub environment, and declaring it here made `secrets.` resolve
-    # to the caller's (empty) value instead, so the github provider ran
-    # unauthenticated into the 60-requests-an-hour limit.
+    # No `secrets:` block, deliberately: declaring TF_GITHUB_TOKEN here made
+    # `secrets.` resolve to the caller's (empty) value. The caller must still
+    # pass `secrets: inherit`, or the called job sees no secrets at all, its
+    # own environment's included.
     outputs:
       has-changes:
         description: '"true" when the plan had changes.'
