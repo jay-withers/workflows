@@ -23,7 +23,10 @@ name: Terraform deploy
 # A configuration that also uses the github provider (github-repos) reads its
 # token from the TF_GITHUB_TOKEN secret on that same environment, never a
 # repository secret: a repository secret reaches a workflow run from any
-# branch, an environment secret only the jobs its branch rules let in.
+# branch, an environment secret only the jobs its branch rules let in. The
+# cloudflare provider (cloudflare) reads CLOUDFLARE_API_TOKEN the same way.
+# Either secret left unset is empty, and a configuration without that
+# provider never reads it.
 #
 # `drift: true` is the nightly drift check: the same plan, but its result is
 # recorded instead of acted on. It never applies and never opens or closes a
@@ -234,6 +237,7 @@ jobs:
           TF_ENVIRONMENT: ${{ inputs.environment }}
           ENVIRONMENT_FILES: ${{ inputs.environment-files }}
           GITHUB_TOKEN: ${{ secrets.TF_GITHUB_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           var_file=()
           if [ "$ENVIRONMENT_FILES" = "true" ]; then
@@ -342,6 +346,7 @@ jobs:
         if: inputs.apply && steps.plan.outputs.has-changes == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.TF_GITHUB_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: terraform apply -input=false -no-color tfplan
 
       # Infrastructure changes are applied by a human, not by a merge: the
