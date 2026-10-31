@@ -145,6 +145,14 @@ jobs:
       ARM_SUBSCRIPTION_ID: ${{ inputs.subscription-id || vars.AZURE_SUBSCRIPTION_ID }}
       TF_IN_AUTOMATION: "true"
     steps:
+      # Audit mode, as in container-apps-deploy.yml: an inventory of where this
+      # job connects, which github-repos' apply runs with Owner-level rights.
+      # Blocking comes later, from that inventory.
+      - name: Harden runner
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+
       - name: Refuse to apply from a pull request
         if: inputs.apply && github.event_name == 'pull_request'
         working-directory: .

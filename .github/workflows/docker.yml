@@ -87,6 +87,17 @@ on:
           Empty reports only.
         type: string
         default: CRITICAL,HIGH
+      attest:
+        description: >-
+          On a push, attest each image's build provenance and its SBOM (from
+          Trivy, so only with `scan`) to GitHub's attestation store and the
+          registry, so a deploy can prove the image came from this workflow
+          and this repository (`gh attestation verify`, or
+          container-apps-deploy.yml's `verify-images`). Needs `id-token: write`
+          and `attestations: write` from the caller, beside `packages: write`.
+          Without `id-token: write` it skips with a warning.
+        type: boolean
+        default: true
       summary-note:
         description: >-
           Line appended to the job summary after the pushed references, for
@@ -183,6 +194,7 @@ jobs:
             exit 1
           fi
 
+          echo "image=$image" >> "$GITHUB_OUTPUT"
           {
             echo "tags<<EOF"
             for value in "${values[@]}"; do
@@ -222,6 +234,7 @@ jobs:
         run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
 
       - name: Build ${{ matrix.image.name }} for ${{ inputs.platforms }}
+        id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ${{ matrix.image.context }}
@@ -311,6 +324,59 @@ jobs:
         with:
           sarif_file: ${{ steps.scan.outputs.sarif }}
           category: trivy-${{ matrix.image.name }}
+
+      # Provenance: a signed statement that this digest was built by this
+      # workflow, from this repository at this commit, which a deploy can check
+      # before rolling the tag out. A tag can be re-pointed by anyone holding a
+      # package write token; a signature over the digest can't be forged.
+      #
+      # Signed with GitHub's OIDC token, so a caller that hasn't granted
+      # `id-token: write` would fail here, after the push. That is checked
+      # first and skipped with a warning instead, so the image still ships.
+      # actions/attest-* rather than raising buildx's own `provenance`/`sbom`
+      # (it already adds min-mode provenance by default): buildx's are
+      # unsigned, while these are signed by this workflow's identity, which
+      # `gh attestation verify --signer-workflow` can pin.
+      - name: Check attestation permissions
+        id: attest
+        if: inputs.push && inputs.attest
+        run: |
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::attest is on but the caller didn't grant id-token: write (and attestations: write), so this image has no provenance and a deploy that verifies it will refuse it."
+          fi
+
+      - name: Attest ${{ matrix.image.name }} build provenance
+        if: steps.attest.outputs.enabled == 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.refs.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      # The SBOM comes from the Trivy that's already installed, scanning the
+      # pushed digest rather than a tag, so it describes exactly what was
+      # attested above.
+      - name: Generate ${{ matrix.image.name }} SBOM
+        id: sbom
+        if: steps.attest.outputs.enabled == 'true' && inputs.scan
+        env:
+          NAME: ${{ matrix.image.name }}
+          REF: ${{ steps.refs.outputs.image }}@${{ steps.build.outputs.digest }}
+        run: |
+          trivy image --quiet --skip-db-update --format cyclonedx \
+            --output "$RUNNER_TEMP/sbom-$NAME.cdx.json" "$REF"
+          echo "path=$RUNNER_TEMP/sbom-$NAME.cdx.json" >> "$GITHUB_OUTPUT"
+
+      - name: Attest ${{ matrix.image.name }} SBOM
+        if: steps.sbom.outputs.path != ''
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ steps.refs.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: ${{ steps.sbom.outputs.path }}
+          push-to-registry: true
 
       # Last, so the findings are uploaded before the job fails on them.
       - name: Refuse fixable ${{ inputs.scan-fail-on }} vulnerabilities
