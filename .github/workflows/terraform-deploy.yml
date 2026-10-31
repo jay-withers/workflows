@@ -168,6 +168,29 @@ jobs:
             fi
           done
 
+      # Every TF_VAR_* Actions variable (environment, repository or owner)
+      # becomes a Terraform input, so values that identify a person or a
+      # subscription live in GitHub rather than in a committed tfvars file.
+      # GitHub stores variable names upper-cased and Terraform matches
+      # TF_VAR_<name> case-sensitively, so the part after the prefix is
+      # lower-cased. A variable the configuration doesn't declare is ignored.
+      - name: Export TF_VAR_* variables
+        working-directory: .
+        env:
+          VARS_JSON: ${{ toJSON(vars) }}
+        run: |
+          jq -r 'to_entries[] | select(.key | startswith("TF_VAR_")) | .key' <<<"$VARS_JSON" |
+            while read -r key; do
+              name="TF_VAR_$(tr '[:upper:]' '[:lower:]' <<<"${key#TF_VAR_}")"
+              delimiter="EOF_$(openssl rand -hex 16)"
+              {
+                echo "$name<<$delimiter"
+                jq -r --arg k "$key" '.[$k]' <<<"$VARS_JSON"
+                echo "$delimiter"
+              } >> "$GITHUB_ENV"
+              echo "Exported $name"
+            done
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
