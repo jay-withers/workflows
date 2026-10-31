@@ -115,6 +115,16 @@ on:
           from separate callers.
         type: string
         default: ""
+      verify-images:
+        description: >-
+          Image references without a tag, whitespace-separated (e.g.
+          `ghcr.io/jay-withers/gym-log/gymlog`). Before deploying, each one at
+          `version` must carry a build provenance attestation signed by this
+          estate's docker.yml for this repository, or the deploy stops before
+          anything changes. Empty skips the check. A rollback isn't checked:
+          the image it returns to may predate attestations, and it already ran.
+        type: string
+        default: ""
       runs-on:
         description: Runner label.
         type: string
@@ -352,6 +362,15 @@ jobs:
       TF_IN_AUTOMATION: "true"
       TF_INPUT: "0"
     steps:
+      # Audit mode: records every outbound connection this job makes, in the
+      # run's StepSecurity insights, without blocking any. The inventory comes
+      # first; an allow-list (egress-policy: block) only once it shows what a
+      # deploy legitimately reaches.
+      - name: Harden runner
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+
       - name: Validate trusted deploy context and version ref
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -377,6 +396,39 @@ jobs:
               exit 1
               ;;
           esac
+
+      # A tag is a pointer anyone with package write can move. Its provenance
+      # attestation is signed over the digest by the workflow that built it,
+      # so this proves the image about to go live was built by docker.yml from
+      # this repository, not pushed by hand or by something else holding a
+      # token. The bundle is read from the registry (docker.yml pushes it
+      # there), so no extra permission is needed, and the packages are public.
+      - name: Verify image provenance
+        if: inputs.verify-images != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGES: ${{ inputs.verify-images }}
+          INPUT_VERSION: ${{ inputs.version }}
+          REPOSITORY: ${{ github.repository }}
+          SIGNER: ${{ github.repository_owner }}/workflows/.github/workflows/docker.yml
+        run: |
+          version="${INPUT_VERSION#refs/tags/}"
+          failed=0
+          while read -r image; do
+            [ -n "$image" ] || continue
+            echo "::group::$image:$version"
+            if gh attestation verify "oci://$image:$version" --bundle-from-oci \
+              --repo "$REPOSITORY" --signer-workflow "$SIGNER" \
+              --predicate-type https://slsa.dev/provenance/v1; then
+              echo "::endgroup::"
+              echo "Verified provenance of \`$image:$version\`." >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::endgroup::"
+              echo "::error::$image:$version has no valid build provenance from $SIGNER for $REPOSITORY."
+              failed=1
+            fi
+          done < <(printf '%s\n' "$IMAGES" | tr -s '[:space:]' '\n')
+          exit "$failed"
 
       - name: Check Azure settings
         env:

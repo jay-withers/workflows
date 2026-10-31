@@ -209,9 +209,13 @@ jobs:
 | `deploy-on-merge` | `renovate` | Which merges deploy without a person: `renovate` (Renovate's releases with no major update; the rest are held) or `all` |
 | `run-workflow` | `cd-publish` | The workflow the `deploy-pending` issue says to run by hand with the tag |
 | `app` | repo name | Recorded as `App` in the deploy event |
+| `verify-images` | `""` | Image references without a tag, whitespace-separated. Each must carry build provenance from `docker.yml` for this repo at `version`, or nothing deploys. Empty skips the check |
 | `runs-on` | `ubuntu-latest` | Runner label |
 
 Notes:
+
+- **Provenance is checked before anything changes**, when `verify-images` is set: `gh attestation verify oci://<image>:<version> --bundle-from-oci --repo <this repo> --signer-workflow <owner>/workflows/.github/workflows/docker.yml`. A tag can be moved by anyone with package write; the attestation is signed over the digest by the workflow that built it. The bundle is read from the registry, so the caller grants nothing extra. A failure fails the run before `make deploy`, so it opens a `deploy-failed` issue and records `failed`. A rollback isn't checked, since its image may predate attestations. Needs the images published by `docker.yml` with `attest` on.
+- The deploy job starts with [harden-runner](https://github.com/step-security/harden-runner) in **audit** mode (as does Terraform deploy's): it logs every outbound connection without blocking any, as the inventory for an allow-list later.
 
 - The calling job must grant `id-token: write` and `contents: read`. When `cd-publish` is itself called from `cd-tag`, `cd-tag`'s calling job must grant `id-token: write` too: a called workflow never holds more than its caller.
 - The target receives `IMAGE_TAG` and `ENV` on the command line. `.terraform-version` is read from the repo root or `terraform/`.
@@ -359,6 +363,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write # attestations
+      attestations: write
     uses: jay-withers/workflows/.github/workflows/docker.yml@main
     with:
       images: '[{"name": "api", "context": "apps/api"}]'
@@ -376,6 +382,7 @@ Notes:
 - **`push` must stay false on a pull request.** A fork's `GITHUB_TOKEN` could not push anyway, and a PR that publishes an image is a supply-chain hole. The cache is shared by image name across both calls, so a release usually reuses the layers its own PR built.
 - A push with no tags fails the job rather than building and publishing nothing usable. A build that is not pushing needs no tags at all.
 - **First push to a GHCR package needs two things `packages: write` cannot supply.** A new package is private whatever the repository's visibility, so make it public once if anything pulls anonymously; and `GITHUB_TOKEN` can only write to a package *linked* to the repository. A package first pushed by hand is user-scoped and unlinked, and the push fails `denied: permission_denied: write_package` — which reads like a missing permission rather than a missing link. The `org.opencontainers.image.source` label establishes the link, but only from a push that is already allowed, so either push once by hand with the label in place or grant the repository Write under the package's "Manage Actions access".
+- **A push attests each image** (`attest`, on by default): a [build provenance](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations) attestation over the pushed digest, and, with `scan`, a CycloneDX SBOM from Trivy. Both are signed with the run's OIDC identity and pushed to GitHub's attestation store and the registry. The caller grants `id-token: write` and `attestations: write`, beside `packages: write`. Without `id-token: write` the image still ships, with a warning, and a deploy that verifies it refuses it. Check one by hand with `gh attestation verify oci://<image>:<tag> --owner jay-withers`.
 - `platforms` is one platform by default. A manifest list with a single entry buys nothing, and a runtime that only ever runs amd64 pays for every other architecture in build minutes.
 
 ### Vulnerability scanning
@@ -412,6 +419,7 @@ That step, and everything after it, rebuilds once a day; everything above it sta
 | `platforms` | `linux/amd64` | Buildx target platforms |
 | `scan` | `true` | Scan each image with Trivy and upload findings to code scanning (needs `security-events: write`) |
 | `scan-fail-on` | `CRITICAL,HIGH` | On a build that doesn't push, fail on these severities when a fix is available. Empty reports only |
+| `attest` | `true` | On a push, attest build provenance and (with `scan`) an SBOM. Needs `id-token: write` and `attestations: write` |
 | `summary-note` | `""` | Markdown line appended to the job summary after the pushed references |
 | `runs-on` | `ubuntu-latest` | Runner label |
 
