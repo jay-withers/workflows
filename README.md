@@ -1,4 +1,4 @@
-# template-pipelines
+# workflows
 
 Reusable GitHub Actions workflows, called from other repositories via `workflow_call`.
 
@@ -245,7 +245,7 @@ on:
 
 jobs:
   pre-commit:
-    uses: jay-withers/template-pipelines/.github/workflows/pre-commit.yml@main
+    uses: jay-withers/workflows/.github/workflows/pre-commit.yml@main
 ```
 
 ### Terraform hooks
@@ -255,7 +255,7 @@ Set `terraform: true` to install the toolchain that Terraform pre-commit hooks (
 ```yaml
 jobs:
   pre-commit:
-    uses: jay-withers/template-pipelines/.github/workflows/pre-commit.yml@main
+    uses: jay-withers/workflows/.github/workflows/pre-commit.yml@main
     with:
       terraform: true
 ```
@@ -437,12 +437,12 @@ on:
 
 jobs:
   release:
-    uses: jay-withers/template-pipelines/.github/workflows/release.yml@main
+    uses: jay-withers/workflows/.github/workflows/release.yml@main
     with:
       update-major-tag: true
 ```
 
-Typically chained after the Terraform apply job with `needs:`, so a release is only cut when the deploy succeeds.
+Every repo calls it from `cd-tag` on each merge to `main`, and `cd-tag` hands the new tag to `cd-publish` when app files changed.
 
 ### Release inputs
 
@@ -520,7 +520,7 @@ Open the repo in the [dev container](.devcontainer/devcontainer.json) (or locall
 
 ```sh
 make install     # install pre-commit and the git hooks
-make lint        # actionlint + shellcheck (falls back to docker if not installed)
+make lint        # actionlint (falls back to docker if not installed)
 make pre-commit  # run all pre-commit hooks against the full repo
 ```
 
@@ -528,4 +528,4 @@ The same hooks run in CI via the repo's own [pre-commit workflow](.github/workfl
 
 ## Versioning
 
-Callers should pin to a tag (`@v1`) or commit SHA rather than `@main` once this repo is tagged, so pipeline changes roll out deliberately.
+Callers pin a full commit SHA with the tag as a trailing comment (`@<sha> # v1.22.0`), and Renovate bumps the pin, so a change here rolls out repo by repo as each pin moves. `@v1` and `@main` work but are not used in this estate.
