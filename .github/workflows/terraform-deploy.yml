@@ -25,6 +25,12 @@ name: Terraform deploy
 # repository secret: a repository secret reaches a workflow run from any
 # branch, an environment secret only the jobs its branch rules let in.
 #
+# `drift: true` is the nightly drift check: the same plan, but its result is
+# recorded instead of acted on. It never applies and never opens or closes a
+# `terraform-pending` issue; it writes one `OpsEvents_CL` row (Kind `drift`,
+# Status `ok`, `drifted` or `failed`) through the Logs Ingestion API, and the
+# platform's alert on that table is what tells someone.
+#
 # This is deliberately separate from terraform.yml, which stays credential-free:
 # a plan needs an identity with read on everything the configuration touches
 # and only succeeds once its dependencies exist, so only repos that meet both
@@ -68,6 +74,14 @@ on:
           which closes once a later run applies them or finds none.
         type: boolean
         default: false
+      drift:
+        description: >-
+          Drift check: plan only, record the result as an `OpsEvents_CL` row
+          (needs the environment's EVENTS_INGESTION_ENDPOINT and
+          EVENTS_DCR_IMMUTABLE_ID), and leave `terraform-pending` issues alone.
+          Refused together with `apply`.
+        type: boolean
+        default: false
       client-id:
         description: >-
           Overrides the environment's AZURE_CLIENT_ID variable. Leave empty to
@@ -98,7 +112,7 @@ on:
 
 jobs:
   deploy:
-    name: ${{ inputs.apply && 'Apply' || 'Plan' }} (${{ inputs.environment }})
+    name: ${{ inputs.apply && 'Apply' || inputs.drift && 'Drift' || 'Plan' }} (${{ inputs.environment }})
     runs-on: ${{ inputs.runs-on }}
     environment: ${{ inputs.github-environment || inputs.environment }}
     # No permissions block, deliberately: the job inherits the caller's grant.
@@ -110,10 +124,11 @@ jobs:
     # apply replacing an older one is fine, since the newer commit on main
     # contains the older one. Plans are grouped by ref, so a push to one PR
     # can't replace another PR's pending plan, or a pending apply. Overlapping
-    # plans and applies wait on the state lock instead.
+    # plans and applies wait on the state lock instead. A drift check has its
+    # own group, so a nightly run never replaces a pending plan on main.
     # Never cancel in progress: killing an apply mid-run leaves state locked.
     concurrency:
-      group: terraform-deploy-${{ github.repository }}-${{ inputs.directory }}-${{ inputs.environment }}-${{ inputs.apply && 'apply' || github.ref }}
+      group: terraform-deploy-${{ github.repository }}-${{ inputs.directory }}-${{ inputs.environment }}-${{ inputs.apply && 'apply' || inputs.drift && 'drift' || github.ref }}
       cancel-in-progress: false
     outputs:
       has-changes: ${{ steps.plan.outputs.has-changes }}
@@ -132,6 +147,13 @@ jobs:
         working-directory: .
         run: |
           echo "::error::apply: true is not allowed on a pull_request event."
+          exit 1
+
+      - name: Refuse to apply from a drift check
+        if: inputs.apply && inputs.drift
+        working-directory: .
+        run: |
+          echo "::error::apply: true and drift: true are mutually exclusive."
           exit 1
 
       - name: Check Azure settings
@@ -308,7 +330,7 @@ jobs:
       # so the issue doesn't email on every merge. Needs `issues: write`;
       # without it this warns and the job's result is unchanged.
       - name: Track pending changes
-        if: always() && github.event_name != 'pull_request' && job.status == 'success'
+        if: always() && github.event_name != 'pull_request' && !inputs.drift && job.status == 'success'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -403,3 +425,70 @@ jobs:
           elif [ -n "$existing" ]; then
             gh issue close "$existing" -R "$REPOSITORY" --comment "Recovered: $RUN_URL (\`$REF\`)" > /dev/null
           fi
+
+      # The drift check's only output. Plan ran with OIDC env vars, not an az
+      # session, so this logs in just to get a token for the ingestion API.
+      - name: Azure login for the drift event
+        if: always() && inputs.drift && vars.EVENTS_INGESTION_ENDPOINT != '' && vars.EVENTS_DCR_IMMUTABLE_ID != ''
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ env.ARM_CLIENT_ID }}
+          tenant-id: ${{ env.ARM_TENANT_ID }}
+          subscription-id: ${{ env.ARM_SUBSCRIPTION_ID }}
+
+      # Same shape as container-apps-deploy's deploy event. A plan that never
+      # ran (init failed, say) has no has-changes, which is a failed check, not
+      # a clean one. A failed post fails the job: a silent gap here would look
+      # exactly like a clean night.
+      - name: Record the drift event
+        if: always() && inputs.drift && job.status != 'cancelled'
+        working-directory: .
+        env:
+          ENDPOINT: ${{ vars.EVENTS_INGESTION_ENDPOINT }}
+          DCR_ID: ${{ vars.EVENTS_DCR_IMMUTABLE_ID }}
+          REPOSITORY: ${{ github.repository }}
+          TF_ENVIRONMENT: ${{ inputs.environment }}
+          DIRECTORY: ${{ inputs.directory }}
+          HAS_CHANGES: ${{ steps.plan.outputs.has-changes }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$ENDPOINT" ] || [ -z "$DCR_ID" ]; then
+            echo "::notice::EVENTS_INGESTION_ENDPOINT or EVENTS_DCR_IMMUTABLE_ID is not set on this job's environment, so this drift check is not recorded."
+            exit 0
+          fi
+
+          repo="${REPOSITORY#*/}"
+          case "$HAS_CHANGES" in
+            false) status=ok detail="No changes." ;;
+            true)
+              status=drifted
+              detail="$(grep -E '^Plan:|^Changes to Outputs:' "$RUNNER_TEMP/plan.txt" | head -1)" ;;
+            *) status=failed detail="The plan did not complete." ;;
+          esac
+
+          row="$(jq -cn \
+            --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg repo "$repo" \
+            --arg env "$TF_ENVIRONMENT" \
+            --arg name "$repo/$DIRECTORY" \
+            --arg status "$status" \
+            --arg detail "$detail" \
+            --arg run "$RUN_URL" \
+            '[{TimeGenerated: $time, Repo: $repo, Environment: $env, Kind: "drift",
+               Name: $name, Status: $status, Detail: $detail, RunUrl: $run}]')"
+          echo "$row"
+
+          if ! token="$(az account get-access-token --resource https://monitor.azure.com --query accessToken -o tsv)"; then
+            echo "::error::No Azure token to record the drift event with (did Azure login succeed?)."
+            exit 1
+          fi
+          code="$(curl -sS -o /tmp/ingest.out -w '%{http_code}' -X POST \
+            "${ENDPOINT%/}/dataCollectionRules/${DCR_ID}/streams/Custom-OpsEvents_CL?api-version=2023-01-01" \
+            -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
+            --data "$row")"
+          # 204 is the only success: the API accepts the batch whole or not at all.
+          if [ "$code" != "204" ]; then
+            echo "::error::Recording the drift event failed with HTTP $code: $(cat /tmp/ingest.out)"
+            exit 1
+          fi
+          echo "Recorded \`$status\` for \`$repo/$DIRECTORY\` in OpsEvents_CL." >> "$GITHUB_STEP_SUMMARY"
