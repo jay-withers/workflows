@@ -33,7 +33,7 @@
   "mounts": [
     "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
   ],
-  "name": "template-pipelines",
+  "name": "workflows",
   "postCreateCommand": "make install",
   "postStartCommand": "sudo /usr/local/bin/docker-socket-setup",
   "remoteUser": "vscode"
