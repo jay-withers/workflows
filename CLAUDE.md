@@ -24,6 +24,7 @@ is `docs/delivery.md` in `jay-withers/factory`.
 .github/workflows/
   terraform.yml               credential-free init + validate (+ terraform test)
   terraform-deploy.yml        OIDC plan, optional apply, drift check, pending/failed issues
+  terraform-unlock.yml        manual force-unlock of a stuck state lock
   container-apps-deploy.yml   gate, provenance check, make deploy, make smoke, rollback, Deployments_CL row
   docker.yml                  build, optional push, Trivy, provenance + SBOM attestations
   pre-commit.yml              pre-commit run --all-files (optional Terraform toolchain)

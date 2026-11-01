@@ -1,0 +1,158 @@
+name: Terraform unlock
+
+# Releases a stuck Terraform state lock with `terraform force-unlock`, for when
+# a plan or apply died mid-run (a cancelled job, a runner lost) and left the
+# state blob leased. Every later plan then fails with "Error acquiring the
+# state lock" and prints the lock ID this needs.
+#
+# Run by hand only: callers wrap it in a `workflow_dispatch` taking the lock ID.
+# It logs in exactly as terraform-deploy.yml does, in the same GitHub
+# environment, so it needs no grant beyond what the plan already has:
+# breaking the blob lease is a write on the state container, which the
+# identity's Storage Blob Data Contributor covers.
+#
+# Force-unlocking under a run that is still going corrupts state, so before
+# unlocking it refuses while another Terraform run (a workflow whose name has
+# "terraform" or "drift" in it, as every caller's does) is in progress in the
+# repo (needs `actions: read`; without it the check only warns). The lock ID must
+# also match the one Terraform reported: force-unlock with any other ID does
+# nothing.
+
+on:
+  workflow_call:
+    inputs:
+      lock-id:
+        description: The lock ID from the "Error acquiring the state lock" message (a UUID).
+        type: string
+        required: true
+      environment:
+        description: >-
+          Environment name, as in terraform-deploy.yml: the GitHub environment
+          the job runs in, and `backends/<environment>.hcl` inside `directory`.
+        type: string
+        default: dev
+      github-environment:
+        description: GitHub environment the job runs in, when it differs from `environment`. Empty uses `environment`.
+        type: string
+        default: ""
+      environment-files:
+        description: Pass `backends/<environment>.hcl` to init. False for a root whose backend block is complete on its own.
+        type: boolean
+        default: true
+      directory:
+        description: Root-module directory, relative to the repository root.
+        type: string
+        default: terraform
+      runs-on:
+        description: Runner label.
+        type: string
+        default: ubuntu-latest
+
+jobs:
+  unlock:
+    name: Unlock (${{ inputs.environment }})
+    runs-on: ${{ inputs.runs-on }}
+    environment: ${{ inputs.github-environment || inputs.environment }}
+    # No permissions block: the job inherits the caller's grant, as in
+    # terraform-deploy.yml.
+    defaults:
+      run:
+        working-directory: ${{ inputs.directory }}
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      TF_IN_AUTOMATION: "true"
+      LOCK_ID: ${{ inputs.lock-id }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+
+      - name: Refuse from a pull request
+        if: github.event_name == 'pull_request'
+        working-directory: .
+        run: |
+          echo "::error::terraform-unlock is not allowed on a pull_request event."
+          exit 1
+
+      - name: Check inputs
+        working-directory: .
+        env:
+          INPUT_ENVIRONMENT: ${{ inputs.github-environment || inputs.environment }}
+        run: |
+          if ! [[ "$LOCK_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+            echo "::error::lock-id must be the UUID from Terraform's lock error."
+            exit 1
+          fi
+          for v in ARM_CLIENT_ID ARM_TENANT_ID ARM_SUBSCRIPTION_ID; do
+            if [ -z "${!v}" ]; then
+              echo "::error::$v is empty. Set AZURE_${v#ARM_} as a variable on the '$INPUT_ENVIRONMENT' environment."
+              exit 1
+            fi
+          done
+
+      - name: Refuse while another run is in progress
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          if ! runs=$(gh api "repos/$REPO/actions/runs?status=in_progress&per_page=100" \
+              --jq ".workflow_runs[] | select(.id != $RUN_ID and (.name | test(\"terraform|drift\"; \"i\"))) | \"\(.name) \(.html_url)\""); then
+            echo "::warning::Could not list in-progress runs (grant actions: read). Make sure no plan or apply is running."
+            exit 0
+          fi
+          if [ -n "$runs" ]; then
+            echo "::error::Other Terraform runs are in progress. Wait for them, or cancel them first:"
+            echo "$runs"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve Terraform version
+        id: tfversion
+        env:
+          INPUT_DIRECTORY: ${{ inputs.directory }}
+        run: |
+          if [ -f .terraform-version ]; then
+            file=.terraform-version
+          elif [ -f "$GITHUB_WORKSPACE/.terraform-version" ]; then
+            file="$GITHUB_WORKSPACE/.terraform-version"
+          else
+            echo "::error::No .terraform-version file found in $INPUT_DIRECTORY or the repo root"
+            exit 1
+          fi
+          echo "version=$(cat "$file")" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ steps.tfversion.outputs.version }}
+          terraform_wrapper: false
+
+      # Init with the backend only: no providers are needed to unlock.
+      - name: Terraform init
+        env:
+          TF_ENVIRONMENT: ${{ inputs.environment }}
+          ENVIRONMENT_FILES: ${{ inputs.environment-files }}
+        run: |
+          if [ "$ENVIRONMENT_FILES" = "true" ]; then
+            terraform init -input=false -backend-config="backends/${TF_ENVIRONMENT}.hcl"
+          else
+            terraform init -input=false
+          fi
+
+      - name: Terraform force-unlock
+        run: |
+          terraform force-unlock -force "$LOCK_ID"
+          {
+            echo "### State unlocked"
+            echo
+            echo "Released lock \`$LOCK_ID\`. Re-run the plan or apply that hit it."
+          } >> "$GITHUB_STEP_SUMMARY"

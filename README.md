@@ -6,6 +6,7 @@ Reusable GitHub Actions workflows, called from other repositories via `workflow_
 | --- | --- |
 | [`terraform.yml`](.github/workflows/terraform.yml) | Terraform CI: credential-free init, validate and optional `terraform test` across one or more root modules |
 | [`terraform-deploy.yml`](.github/workflows/terraform-deploy.yml) | Terraform CD: OIDC to Azure, plan one root module for one environment, and optionally apply the saved plan |
+| [`terraform-unlock.yml`](.github/workflows/terraform-unlock.yml) | Run by hand: releases a stuck Terraform state lock with `terraform force-unlock`, as the same identity the plan uses |
 | [`container-apps-deploy.yml`](.github/workflows/container-apps-deploy.yml) | App CD: OIDC to Azure, then the caller's own `make deploy IMAGE_TAG=<version>` rolls a published image onto its Container Apps workloads |
 | [`pre-commit.yml`](.github/workflows/pre-commit.yml) | Runs all pre-commit hooks against the full repository |
 | [`python.yml`](.github/workflows/python.yml) | Python CI: runs a project's test suite with uv |
@@ -169,6 +170,58 @@ Notes:
 - **A configuration using the github provider** gets `GITHUB_TOKEN` from a `TF_GITHUB_TOKEN` secret on the job's GitHub environment, for plan and apply. Set it on the environment, never as a repository secret, which any branch's run could read. The calling job must pass `secrets: inherit`: without it the called job sees no secrets, its own environment's included, and the provider runs unauthenticated (`403 API rate limit of 60`).
 - **A configuration using the cloudflare provider** gets `CLOUDFLARE_API_TOKEN` from a secret of the same name on the job's GitHub environment, for plan and apply, with the same rules: an environment secret, never a repository one, and `secrets: inherit` on the calling job.
 - **Separate plan and apply identities** (github-repos): PR plans run in an environment holding a read-only identity and token, and the push and manual runs pass `github-environment` naming one with a deployment branch policy of `main` only, which holds the privileged ones. Pending and failed issues stay keyed on `environment`, so they don't split in two.
+
+## Terraform unlock
+
+Releases a stuck state lock after a plan or apply died mid-run and left the
+state blob leased, so every later plan fails with `Error acquiring the state
+lock`. Callers wrap it in a `workflow_dispatch` taking the lock ID that error
+prints, and pass the same environment inputs as their `cd-terraform` call:
+
+```yaml
+# .github/workflows/manual-terraform-unlock.yml
+name: manual-terraform-unlock
+on:
+  workflow_dispatch:
+    inputs:
+      lock-id:
+        description: Lock ID from the "Error acquiring the state lock" message
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  unlock:
+    permissions:
+      id-token: write
+      contents: read
+      actions: read # the in-progress check
+    uses: jay-withers/workflows/.github/workflows/terraform-unlock.yml@<sha> # v1.x.0
+    with:
+      lock-id: ${{ inputs.lock-id }}
+      environment: dev
+```
+
+### Terraform unlock inputs
+
+| Input | Default | Description |
+| --- | --- | --- |
+| `lock-id` | (required) | The UUID from Terraform's lock error. Anything else is refused |
+| `environment` | `dev` | GitHub environment the job runs in, and picks `backends/<environment>.hcl` inside `directory` |
+| `github-environment` | `""` | Runs the job in this GitHub environment instead of `environment` (github-repos: `apply`) |
+| `environment-files` | `true` | `false` inits with the root's own backend block |
+| `directory` | `terraform` | Root-module directory, relative to the repo root |
+| `runs-on` | `ubuntu-latest` | Runner label |
+
+Notes:
+
+- No new grant: breaking the lease is a write on the state container, which
+  the plan identity's Storage Blob Data Contributor already covers.
+- **It refuses while another Terraform run is in progress** in the repo (any
+  workflow named with `terraform` or `drift`), since force-unlocking under a
+  live apply corrupts state. That check needs `actions: read`; without it the
+  step warns and carries on.
+- Refused on `pull_request`. Only run it once you've confirmed the run that took the lock is dead.
 
 ## Container Apps deploy
 
