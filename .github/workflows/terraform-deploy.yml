@@ -31,8 +31,11 @@ name: Terraform deploy
 # `drift: true` is the nightly drift check: the same plan, but its result is
 # recorded instead of acted on. It never applies and never opens or closes a
 # `terraform-pending` issue; it writes one `OpsEvents_CL` row (Kind `drift`,
-# Status `ok`, `drifted` or `failed`) through the Logs Ingestion API, and the
-# platform's alert on that table is what tells someone.
+# Status `ok`, `drifted`, `pending` or `failed`) through the Logs Ingestion API,
+# and the platform's alert on that table is what tells someone. `pending` is a
+# plan with changes while this directory and environment's `terraform-pending`
+# issue is open: a merged change waiting to be applied, which that issue
+# already reports, so the alert leaves it alone.
 #
 # This is deliberately separate from terraform.yml, which stays credential-free:
 # a plan needs an identity with read on everything the configuration touches
@@ -475,11 +478,15 @@ jobs:
       # Same shape as container-apps-deploy's deploy event. A plan that never
       # ran (init failed, say) has no has-changes, which is a failed check, not
       # a clean one. A failed post fails the job: a silent gap here would look
-      # exactly like a clean night.
+      # exactly like a clean night. Changes with the `terraform-pending` issue
+      # open are `pending`, not `drifted`; if the issue can't be read (no
+      # `issues: read`), they stay `drifted`, so nothing is hidden.
       - name: Record the drift event
         if: always() && inputs.drift && job.status != 'cancelled'
         working-directory: .
         env:
+          GH_TOKEN: ${{ github.token }}
+          MARKER: "<!-- terraform-pending:${{ inputs.directory }}:${{ inputs.environment }} -->"
           ENDPOINT: ${{ vars.EVENTS_INGESTION_ENDPOINT }}
           DCR_ID: ${{ vars.EVENTS_DCR_IMMUTABLE_ID }}
           REPOSITORY: ${{ github.repository }}
@@ -498,7 +505,13 @@ jobs:
             false) status=ok detail="No changes." ;;
             true)
               status=drifted
-              detail="$(grep -E '^Plan:|^Changes to Outputs:' "$RUNNER_TEMP/plan.txt" | head -1)" ;;
+              detail="$(grep -E '^Plan:|^Changes to Outputs:' "$RUNNER_TEMP/plan.txt" | head -1)"
+              pending="$(gh issue list -R "$REPOSITORY" --label terraform-pending --state open \
+                --json number,body --jq ".[] | select(.body | contains(\"$MARKER\")) | .number" | head -1)" || pending=""
+              if [ -n "$pending" ]; then
+                status=pending
+                detail="$detail Waiting on terraform-pending #$pending."
+              fi ;;
             *) status=failed detail="The plan did not complete." ;;
           esac
 
