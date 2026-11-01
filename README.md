@@ -117,7 +117,7 @@ jobs:
       apply: ${{ github.event_name == 'workflow_dispatch' }}
 ```
 
-**Drift is checked nightly, not by a person.** A scheduled caller with `drift: true` runs the same plan and records the result as one `OpsEvents_CL` row (`Kind` `drift`, `Status` `ok`, `drifted` or `failed`) through the Logs Ingestion API, using the environment's `EVENTS_INGESTION_ENDPOINT` and `EVENTS_DCR_IMMUTABLE_ID` (set by github-repos for a consumer with `send_events = true`; without them the step is skipped with a notice). It never applies and leaves `terraform-pending` issues alone: the platform's alert on `OpsEvents_CL` is what reports a drifted root. A drifted plan is still a green run; only a plan that errors, or a failed post, fails it.
+**Drift is checked nightly, not by a person.** A scheduled caller with `drift: true` runs the same plan and records the result as one `OpsEvents_CL` row (`Kind` `drift`, `Status` `ok`, `drifted`, `pending` or `failed`) through the Logs Ingestion API, using the environment's `EVENTS_INGESTION_ENDPOINT` and `EVENTS_DCR_IMMUTABLE_ID` (set by github-repos for a consumer with `send_events = true`; without them the step is skipped with a notice). It never applies and leaves `terraform-pending` issues alone: the platform's alert on `OpsEvents_CL` is what reports a drifted root. A plan with changes while that directory and environment's `terraform-pending` issue is open records `pending` (v1.24.0+): a merged change waiting for its apply, which the issue already reports, so it doesn't alert as drift. If the issue list can't be read, it stays `drifted`. A drifted plan is still a green run; only a plan that errors, or a failed post, fails it.
 
 ```yaml
 # Nightly drift check (the caller's schedule-drift)
@@ -151,7 +151,7 @@ jobs:
 | `environment-files` | `true` | `false` passes neither file: for a root with one deployment, whose backend block and `terraform.tfvars` are complete |
 | `directory` | `terraform` | Root-module directory, relative to the repo root |
 | `apply` | `false` | Apply the saved plan when it has changes. Refused on `pull_request` |
-| `drift` | `false` | Nightly drift check: plan only, record `ok`/`drifted`/`failed` as an `OpsEvents_CL` row, never touch `terraform-pending` issues. Refused with `apply` |
+| `drift` | `false` | Nightly drift check: plan only, record `ok`/`drifted`/`pending`/`failed` as an `OpsEvents_CL` row, never touch `terraform-pending` issues. Refused with `apply` |
 | `client-id` | `""` | Overrides the environment's `AZURE_CLIENT_ID` |
 | `tenant-id` | `""` | Overrides the environment's `AZURE_TENANT_ID` |
 | `subscription-id` | `""` | Overrides the environment's `AZURE_SUBSCRIPTION_ID` |
