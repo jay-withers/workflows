@@ -29,7 +29,7 @@
       }
     }
   },
-  "image": "ghcr.io/jay-withers/dev-containers/base:latest@sha256:db22359d4e0416765db98d2b7b63e8325390688615ebe75643b61f5a6af232bd",
+  "image": "ghcr.io/jay-withers/dev-containers/base:latest@sha256:1d919a8a86aea33c7f72522d00eff0bf0ae22f1bd6939b534c254837d87ae52a",
   "mounts": [
     "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
   ],
