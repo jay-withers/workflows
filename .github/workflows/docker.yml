@@ -104,6 +104,14 @@ on:
           whatever the reader does next (a deploy command, say). Markdown.
         type: string
         default: ""
+      failure-issue:
+        description: >-
+          Open a `build-failed` issue when a build fails (the Trivy gate
+          included), comment on it while it keeps failing, and close it on the
+          next success. For a scheduled build of main; ignored on a pull
+          request. Needs `issues: write` from the caller.
+        type: boolean
+        default: false
       runs-on:
         description: Runner label.
         type: string
@@ -406,3 +414,56 @@ jobs:
               echo "$NOTE"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # A scheduled build of main reports through an issue, because nothing else
+  # would. The gate fails on a fixable CVE published after the last merge,
+  # and nothing has changed on main to trigger a build, so the first anyone
+  # heard was a Renovate PR failing container-build for a reason that had
+  # nothing to do with it. Every other PR then failed the same way, and
+  # repo-agent's weekly digest named them 11-13 days later (security-testing's
+  # pyasn1, November 2026). A daily build with this on gets an email the day
+  # the fix is available. Same shape as container-apps-deploy.yml's
+  # deploy-failed issue: one open issue per repository, found by a hidden
+  # marker, a comment per repeat failure, and closed by the next success.
+  # Needs `issues: write`; without it this warns and the result stands.
+  report:
+    name: Report
+    needs: build
+    if: >-
+      always() && inputs.failure-issue
+      && github.event_name != 'pull_request'
+      && needs.build.result != 'cancelled' && needs.build.result != 'skipped'
+    runs-on: ${{ inputs.runs-on }}
+    continue-on-error: true
+    steps:
+      - name: Report the outcome as an issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          OUTCOME: ${{ needs.build.result }}
+          REF: ${{ github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MARKER: "<!-- build-failed:docker.yml -->"
+        run: |
+          label=build-failed
+          if ! existing="$(gh issue list -R "$REPOSITORY" --label "$label" --state open \
+            --json number,body --jq ".[] | select(.body | contains(\"$MARKER\")) | .number" 2>&1 | head -1)"; then
+            echo "::warning::Could not read issues (grant issues: write): $existing"
+            exit 0
+          fi
+          if [ "$OUTCOME" = "failure" ]; then
+            gh label create "$label" -R "$REPOSITORY" --color B60205 \
+              --description "The image no longer builds or passes Trivy on main. Closed by the next success." 2>/dev/null || true
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" -R "$REPOSITORY" --body "Failed again: $RUN_URL" > /dev/null
+            else
+              body="$(printf '%s\n%s\n\n%s\n\n%s\n' "$MARKER" \
+                "@$OWNER The image build on \`$REF\` failed: it no longer builds, or Trivy found a fixable CRITICAL/HIGH vulnerability. Every pull request's \`container-build\` check fails the same way until it is fixed, so Renovate's PRs stop merging." \
+                "Run: $RUN_URL" \
+                "Fix it on main (bump the base image or package, or accept the risk in \`.trivyignore\`). This issue closes itself on the next successful build.")"
+              gh issue create -R "$REPOSITORY" --title "Image build on $REF failed" --label "$label" --body "$body" > /dev/null
+            fi
+          elif [ -n "$existing" ]; then
+            gh issue close "$existing" -R "$REPOSITORY" --comment "Recovered: $RUN_URL" > /dev/null
+          fi

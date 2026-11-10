@@ -458,6 +458,28 @@ RUN apt-get update \
 
 That step, and everything after it, rebuilds once a day; everything above it stays cached. A Dockerfile that doesn't declare the ARG builds exactly as before.
 
+**Build main daily, so a new CVE reaches you before it reaches a PR (v1.25.0+).** The gate only runs when something builds, and nothing builds main between merges. So a fix published for something in the image fails the next PR's `container-build`, whatever that PR is about, and every Renovate PR after it, until someone notices (security-testing's pyasn1 held five PRs for 13 days in November 2026). Run the PR workflow on a schedule as well, with `failure-issue` on outside pull requests: a failed build opens a `build-failed` issue that @-mentions the owner, a repeat failure comments on it, and the next success closes it. The caller grants `issues: write`; without it the report warns and the build's result stands. repo-agent's digest lists open `build-failed` issues.
+
+```yaml
+on:
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+jobs:
+  build:
+    permissions:
+      contents: read
+      security-events: write
+      issues: write # failure-issue
+    uses: jay-withers/workflows/.github/workflows/docker.yml@main
+    with:
+      images: '[{"name": "api", "context": "."}]'
+      failure-issue: ${{ github.event_name != 'pull_request' }}
+```
+
 ### Docker inputs
 
 | Input | Default | Description |
@@ -474,6 +496,7 @@ That step, and everything after it, rebuilds once a day; everything above it sta
 | `scan-fail-on` | `CRITICAL,HIGH` | On a build that doesn't push, fail on these severities when a fix is available. Empty reports only |
 | `attest` | `true` | On a push, attest build provenance and (with `scan`) an SBOM. Needs `id-token: write` and `attestations: write` |
 | `summary-note` | `""` | Markdown line appended to the job summary after the pushed references |
+| `failure-issue` | `false` | Outside a pull request, open a `build-failed` issue when the build or the Trivy gate fails, and close it on the next success. Needs `issues: write` (v1.25.0+) |
 | `runs-on` | `ubuntu-latest` | Runner label |
 
 ## Semver release tagging
