@@ -16,17 +16,17 @@ Reusable GitHub Actions workflows, called from other repositories via `workflow_
 
 ## Toolchain from mise
 
-(v1.26.0+) A repo with a `mise.toml` (or `.mise.toml`) at its root gets its tools from it in `terraform.yml`, `terraform-deploy.yml`, `terraform-unlock.yml`, `pre-commit.yml` and `python.yml`: each job runs [`jdx/mise-action`](https://github.com/jdx/mise-action) (tools cached between runs) and skips its own setup steps. The same file pins the tools on a developer's machine, so CI runs what you run. With a `mise.lock` alongside, mise installs with `--locked`, checking every download against the recorded checksum.
+(v1.26.0+) A repo with a `mise.toml` (or `.mise.toml`) at its root gets its tools from it in `terraform.yml`, `terraform-deploy.yml`, `terraform-unlock.yml`, `pre-commit.yml`, `python.yml` and (v1.26.1+, Terraform only) `container-apps-deploy.yml`: each job runs [`jdx/mise-action`](https://github.com/jdx/mise-action) (tools cached between runs) and skips its own setup steps. The same file pins the tools on a developer's machine, so CI runs what you run. With a `mise.lock` alongside, mise installs with `--locked`, checking every download against the recorded checksum.
 
 What each workflow then needs from `mise.toml`, failing with an error naming the tool when it is missing:
 
 | Workflow | Must list | Ignored inputs |
 | --- | --- | --- |
-| `terraform.yml`, `terraform-deploy.yml`, `terraform-unlock.yml` | `terraform` (replaces `.terraform-version`) | none |
+| `terraform.yml`, `terraform-deploy.yml`, `terraform-unlock.yml`, `container-apps-deploy.yml` (v1.26.1+) | `terraform` (replaces `.terraform-version`) | none |
 | `pre-commit.yml` | `pre-commit`, plus whatever your hooks call: with `terraform: true`, `terraform`, `tflint`, `terraform-docs` and `checkov` | `python-version`, `node-version`, `terraform-version`, `terraform-docs-version`, `checkov-version` |
 | `python.yml` | `uv`, and `python` to choose the interpreter (exported as `UV_PYTHON`; without it uv picks one itself) | `python-version` |
 
-`tflint --init` still runs with `terraform: true`. A repo without `mise.toml` sees no change. Renovate's shared `mise` preset keeps the versions current.
+`terraform.yml`'s change filter counts `mise.toml` as a Terraform change (v1.26.1+), so a Terraform bump there is validated. `tflint --init` still runs with `terraform: true`. A repo without `mise.toml` sees no change. Renovate's shared `mise` preset keeps the versions current.
 
 ## Terraform CI
 
@@ -79,7 +79,7 @@ Notes:
   ```
 
   A job gated this way needs its own always-reporting gate before it can be a required check — `<caller job id> / Terraform` covers only what runs *inside* this workflow.
-- The Terraform version comes from a `.terraform-version` file (the [tfenv](https://github.com/tfutils/tfenv) convention) — looked up in each directory first, then the repo root. Renovate's built-in `terraform-version` manager (part of `config:recommended`) keeps it bumped.
+- The Terraform version comes from `mise.toml` when the repo has one (see [Toolchain from mise](#toolchain-from-mise)), otherwise from a `.terraform-version` file (the [tfenv](https://github.com/tfutils/tfenv) convention), looked up in each directory first, then the repo root. Renovate keeps either bumped.
 - `fmt`, TFLint and Checkov are not run here — they belong to `pre-commit.yml`.
 
 ## Terraform deploy
@@ -112,7 +112,7 @@ name: cd-terraform
 on:
   push:
     branches: [main]
-    paths: ["terraform/**", ".terraform-version"]
+    paths: ["terraform/**", "mise.toml", ".terraform-version"]
   workflow_dispatch:
 
 permissions:
@@ -285,7 +285,7 @@ Notes:
 - The deploy job starts with [harden-runner](https://github.com/step-security/harden-runner) in **audit** mode (as does Terraform deploy's): it logs every outbound connection without blocking any, as the inventory for an allow-list later.
 
 - The calling job must grant `id-token: write` and `contents: read`. When `cd-publish` is itself called from `cd-tag`, `cd-tag`'s calling job must grant `id-token: write` too: a called workflow never holds more than its caller.
-- The target receives `IMAGE_TAG` and `ENV` on the command line. `.terraform-version` is read from the repo root or `terraform/`.
+- The target receives `IMAGE_TAG` and `ENV` on the command line. Terraform comes from `mise.toml` when the deployed tag has one (v1.26.1+), else from `.terraform-version` in the repo root or `terraform/`.
 - One deploy runs at a time per repo and environment; a newer pending deploy replaces an older one, and an in-progress deploy is never cancelled. The concurrency group is separate from Terraform deploy's, so a merge that changes both runs them side by side. That's safe while the image and its env vars are under `ignore_changes` in Terraform, as `make deploy` assumes.
 - Refused on a `pull_request` event.
 - **Only Renovate's merges deploy themselves.** A `gate` job runs first and holds a release when a person authored its commit, when a tracked `uv.lock` moves a package up a major version (a minor, below 1.0) since the previous release, or when an earlier release is already held (a release carries every commit before it). A hold publishes nothing new: the image is already built. It opens one `deploy-pending` issue per environment and app, @-mentioning the repo owner and naming the tag and any major updates. A later hold moves the issue to the newer tag. Running the caller by hand (`cd-publish`'s *Run workflow*) with that tag deploys it, and the issue closes once that deploy succeeds. Re-running a held run deploys too. Majors are found in the lock files because pyproject sets only lower bounds, so most arrive inside Renovate's lock-file maintenance, which Renovate never calls major. It reads the lock files through the API, never checking the release out. The gate fails the run if it can't read them or can't open the issue, rather than deploy unchecked or hold silently. `deploy-on-merge: all` turns the hold off. The deploy event records a held release's deploy as `manual`, with the hold in its lead time.

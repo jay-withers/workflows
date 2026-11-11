@@ -446,8 +446,36 @@ jobs:
         with:
           ref: ${{ inputs.version }}
 
+      # A repo with a mise.toml at its root gets Terraform from it; the tag
+      # being deployed may predate it, so .terraform-version still works.
+      - name: Detect mise.toml
+        id: mise
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/mise.toml" ] || [ -f "$GITHUB_WORKSPACE/.mise.toml" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup mise
+        if: steps.mise.outputs.enabled == 'true'
+        uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          working_directory: ${{ github.workspace }}
+          install_args: terraform
+
+      - name: Check Terraform comes from mise
+        if: steps.mise.outputs.enabled == 'true'
+        run: |
+          if ! command -v terraform >/dev/null; then
+            echo "::error::mise.toml has no terraform. Add it, e.g. \`mise use terraform@<version>\`."
+            exit 1
+          fi
+          terraform --version
+
       - name: Resolve Terraform version
         id: tfversion
+        if: steps.mise.outputs.enabled != 'true'
         run: |
           for file in .terraform-version terraform/.terraform-version; do
             if [ -f "$file" ]; then
@@ -459,6 +487,7 @@ jobs:
           exit 1
 
       - name: Setup Terraform
+        if: steps.mise.outputs.enabled != 'true'
         uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
           terraform_version: ${{ steps.tfversion.outputs.version }}
