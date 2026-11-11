@@ -1,0 +1,14 @@
+{
+  "recommendations": [
+    "anthropic.claude-code",
+    "redhat.vscode-yaml",
+    "github.vscode-github-actions",
+    "github.vscode-pull-request-github",
+    "timonwong.shellcheck",
+    "foxundermoon.shell-format",
+    "davidanson.vscode-markdownlint",
+    "eamodio.gitlens",
+    "mhutchie.git-graph",
+    "editorconfig.editorconfig"
+  ]
+}
