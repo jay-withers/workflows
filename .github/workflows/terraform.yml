@@ -84,8 +84,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # A repo with a mise.toml at its root gets every tool from it, at the
+      # versions (and, with a mise.lock, the checksums) it pins; the setup
+      # steps below are only for repos that have not moved yet. See
+      # "Toolchain from mise" in the README.
+      - name: Detect mise.toml
+        id: mise
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/mise.toml" ] || [ -f "$GITHUB_WORKSPACE/.mise.toml" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup mise
+        if: steps.mise.outputs.enabled == 'true'
+        uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          working_directory: ${{ github.workspace }}
+
       - name: Resolve Terraform version
         id: tfversion
+        if: steps.mise.outputs.enabled != 'true'
         # The directory reaches the script as an environment variable, never
         # interpolated into it: `${{ }}` in `run:` is pasted in as shell text,
         # so a crafted value would execute.
@@ -103,6 +123,7 @@ jobs:
           echo "version=$(cat "$file")" >> "$GITHUB_OUTPUT"
 
       - name: Setup Terraform
+        if: steps.mise.outputs.enabled != 'true'
         uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
           terraform_version: ${{ steps.tfversion.outputs.version }}
@@ -112,6 +133,15 @@ jobs:
       # modules and providers without touching the configured backend, so a
       # repo whose backend.tf points at a real remote state account still
       # validates on a fork or a fresh clone with no Azure auth at all.
+      - name: Check Terraform comes from mise
+        if: steps.mise.outputs.enabled == 'true'
+        run: |
+          if ! command -v terraform >/dev/null; then
+            echo "::error::mise.toml has no terraform. Add it, e.g. \`mise use terraform@<version>\`."
+            exit 1
+          fi
+          terraform --version
+
       - name: Terraform init
         run: terraform init -input=false -backend=false
 
@@ -139,8 +169,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # A repo with a mise.toml at its root gets every tool from it, at the
+      # versions (and, with a mise.lock, the checksums) it pins; the setup
+      # steps below are only for repos that have not moved yet. See
+      # "Toolchain from mise" in the README.
+      - name: Detect mise.toml
+        id: mise
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/mise.toml" ] || [ -f "$GITHUB_WORKSPACE/.mise.toml" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup mise
+        if: steps.mise.outputs.enabled == 'true'
+        uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          working_directory: ${{ github.workspace }}
+
       - name: Resolve Terraform version
         id: tfversion
+        if: steps.mise.outputs.enabled != 'true'
         # The directory reaches the script as an environment variable, never
         # interpolated into it: `${{ }}` in `run:` is pasted in as shell text,
         # so a crafted value would execute.
@@ -158,10 +208,20 @@ jobs:
           echo "version=$(cat "$file")" >> "$GITHUB_OUTPUT"
 
       - name: Setup Terraform
+        if: steps.mise.outputs.enabled != 'true'
         uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
           terraform_version: ${{ steps.tfversion.outputs.version }}
           terraform_wrapper: false
+
+      - name: Check Terraform comes from mise
+        if: steps.mise.outputs.enabled == 'true'
+        run: |
+          if ! command -v terraform >/dev/null; then
+            echo "::error::mise.toml has no terraform. Add it, e.g. \`mise use terraform@<version>\`."
+            exit 1
+          fi
+          terraform --version
 
       - name: Terraform init
         run: terraform init -input=false -backend=false

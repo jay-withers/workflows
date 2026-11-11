@@ -14,6 +14,20 @@ Reusable GitHub Actions workflows, called from other repositories via `workflow_
 | [`release.yml`](.github/workflows/release.yml) | Semver tagging on CD: bumps from conventional commits, pushes the tag, creates a GitHub release |
 | [`codeql.yml`](.github/workflows/codeql.yml) | Code scanning: CodeQL static analysis, one job per language, results in the Security tab |
 
+## Toolchain from mise
+
+(v1.26.0+) A repo with a `mise.toml` (or `.mise.toml`) at its root gets its tools from it in `terraform.yml`, `terraform-deploy.yml`, `terraform-unlock.yml`, `pre-commit.yml` and `python.yml`: each job runs [`jdx/mise-action`](https://github.com/jdx/mise-action) (tools cached between runs) and skips its own setup steps. The same file pins the tools on a developer's machine, so CI runs what you run. With a `mise.lock` alongside, mise installs with `--locked`, checking every download against the recorded checksum.
+
+What each workflow then needs from `mise.toml`, failing with an error naming the tool when it is missing:
+
+| Workflow | Must list | Ignored inputs |
+| --- | --- | --- |
+| `terraform.yml`, `terraform-deploy.yml`, `terraform-unlock.yml` | `terraform` (replaces `.terraform-version`) | none |
+| `pre-commit.yml` | `pre-commit`, plus whatever your hooks call: with `terraform: true`, `terraform`, `tflint`, `terraform-docs` and `checkov` | `python-version`, `node-version`, `terraform-version`, `terraform-docs-version`, `checkov-version` |
+| `python.yml` | `uv`, and `python` to choose the interpreter (exported as `UV_PYTHON`; without it uv picks one itself) | `python-version` |
+
+`tflint --init` still runs with `terraform: true`. A repo without `mise.toml` sees no change. Renovate's shared `mise` preset keeps the versions current.
+
 ## Terraform CI
 
 Credential-free validation of every root module in the calling repository: `terraform init -backend=false` then `terraform validate`, one matrix leg per directory, plus an optional `terraform test` job for repos whose tests mock their providers.

@@ -42,20 +42,40 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # A repo with a mise.toml at its root gets every tool from it, at the
+      # versions (and, with a mise.lock, the checksums) it pins; the setup
+      # steps below are only for repos that have not moved yet. See
+      # "Toolchain from mise" in the README.
+      - name: Detect mise.toml
+        id: mise
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/mise.toml" ] || [ -f "$GITHUB_WORKSPACE/.mise.toml" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup mise
+        if: steps.mise.outputs.enabled == 'true'
+        uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          working_directory: ${{ github.workspace }}
+
       - name: Setup Python
+        if: steps.mise.outputs.enabled != 'true'
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ inputs.python-version }}
 
       - name: Setup Node.js
-        if: inputs.terraform
+        if: inputs.terraform && steps.mise.outputs.enabled != 'true'
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ inputs.node-version }}
 
       - name: Resolve Terraform version
         id: tfversion
-        if: inputs.terraform
+        if: inputs.terraform && steps.mise.outputs.enabled != 'true'
         run: |
           if [ -n "${{ inputs.terraform-version }}" ]; then
             version="${{ inputs.terraform-version }}"
@@ -67,15 +87,24 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Setup Terraform
-        if: inputs.terraform
+        if: inputs.terraform && steps.mise.outputs.enabled != 'true'
         uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
           terraform_version: ${{ steps.tfversion.outputs.version }}
           terraform_wrapper: false
 
       - name: Setup TFLint
-        if: inputs.terraform
+        if: inputs.terraform && steps.mise.outputs.enabled != 'true'
         uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+
+      - name: Check pre-commit comes from mise
+        if: steps.mise.outputs.enabled == 'true'
+        run: |
+          if ! command -v pre-commit >/dev/null; then
+            echo "::error::mise.toml has no pre-commit. Add it, e.g. \`mise use pre-commit@<version>\`."
+            exit 1
+          fi
+          pre-commit --version
 
       - name: Initialise TFLint plugins
         if: inputs.terraform
@@ -87,7 +116,7 @@ jobs:
           fi
 
       - name: Install terraform-docs
-        if: inputs.terraform
+        if: inputs.terraform && steps.mise.outputs.enabled != 'true'
         env:
           TERRAFORM_DOCS_VERSION: ${{ inputs.terraform-docs-version }}
         run: |
@@ -96,7 +125,7 @@ jobs:
           sudo chmod +x /usr/local/bin/terraform-docs
 
       - name: Install Checkov
-        if: inputs.terraform
+        if: inputs.terraform && steps.mise.outputs.enabled != 'true'
         run: pip install "checkov==${{ inputs.checkov-version }}"
 
       - name: Cache pre-commit hooks
@@ -106,6 +135,7 @@ jobs:
           key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
 
       - name: Install pre-commit
+        if: steps.mise.outputs.enabled != 'true'
         run: pip install pre-commit
 
       - name: Run pre-commit

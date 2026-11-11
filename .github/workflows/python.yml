@@ -87,12 +87,47 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # A repo with a mise.toml at its root gets every tool from it, at the
+      # versions (and, with a mise.lock, the checksums) it pins; the setup
+      # steps below are only for repos that have not moved yet. See
+      # "Toolchain from mise" in the README.
+      - name: Detect mise.toml
+        id: mise
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/mise.toml" ] || [ -f "$GITHUB_WORKSPACE/.mise.toml" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup mise
+        if: steps.mise.outputs.enabled == 'true'
+        uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          working_directory: ${{ github.workspace }}
+
       - name: Setup uv
+        if: steps.mise.outputs.enabled != 'true'
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: ${{ inputs.python-version }}
           enable-cache: true
           cache-dependency-glob: ${{ inputs.working-directory }}/uv.lock
+
+      # uv would otherwise pick whichever interpreter it finds first, or
+      # download its own; point it at the one mise.toml pins, if any.
+      - name: Check uv comes from mise
+        if: steps.mise.outputs.enabled == 'true'
+        run: |
+          if ! command -v uv >/dev/null; then
+            echo "::error::mise.toml has no uv. Add it, e.g. \`mise use uv@<version>\`."
+            exit 1
+          fi
+          uv --version
+          if python="$(mise which python 2>/dev/null)"; then
+            echo "UV_PYTHON=$python" >> "$GITHUB_ENV"
+            "$python" --version
+          fi
 
       # `docker run` rather than a `services:` block, which cannot be made
       # conditional: a service with an empty image is a workflow error, so
