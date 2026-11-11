@@ -6,7 +6,7 @@ help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
 
 install: ## Install dev tooling and git hooks
-	@command -v pre-commit >/dev/null 2>&1 || pip install --user pre-commit || pipx install pre-commit
+	mise install
 	pre-commit install
 
 lint: actionlint ## Run all linters

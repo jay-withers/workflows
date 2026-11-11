@@ -606,10 +606,10 @@ This repo dogfoods its own reusable workflows by calling them with local paths (
 
 ## Development
 
-Open the repo in the [dev container](.devcontainer/devcontainer.json) (or locally with `make install`) to get the git hooks set up. Useful targets:
+Tools are pinned in [`mise.toml`](mise.toml): set up a machine once with [jay-withers/toolchain](https://github.com/jay-withers/toolchain), then `mise trust && make install` here (it runs `mise install` first, then sets up the git hooks). This repo's own CI installs from the same file. Useful targets:
 
 ```sh
-make install     # install pre-commit and the git hooks
+make install     # install mise tools (mise.toml) and the git hooks
 make lint        # actionlint (falls back to docker if not installed)
 make pre-commit  # run all pre-commit hooks against the full repo
 ```

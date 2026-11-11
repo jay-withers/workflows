@@ -99,7 +99,7 @@ There is no test suite. Before opening a PR:
 ## Commands
 
 ```bash
-make install      # install pre-commit and the git hooks
+make install      # install mise tools (mise.toml) and the git hooks
 make lint         # actionlint (falls back to docker if not installed)
 make pre-commit   # run all pre-commit hooks against the full repo
 ```
