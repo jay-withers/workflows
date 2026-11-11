@@ -62,6 +62,8 @@ jobs:
             terraform:
               - 'terraform/**'
               - '.terraform-version'
+              - 'mise.toml'
+              - '.mise.toml'
               - '.github/workflows/ci-terraform.yml'
 
   validate:
