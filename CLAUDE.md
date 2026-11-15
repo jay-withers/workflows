@@ -28,7 +28,7 @@ is `docs/delivery.md` in `jay-withers/factory`.
   container-apps-deploy.yml   gate, provenance check, make deploy, make smoke, rollback, Deployments_CL row
   docker.yml                  build, optional push, Trivy, provenance + SBOM attestations
   pre-commit.yml              pre-commit run --all-files (optional Terraform toolchain)
-  python.yml                  uv + pytest, optional coverage and Postgres
+  python.yml                  uv + pytest, optional coverage, diff-coverage gate, type check, Postgres
   codeql.yml                  CodeQL per language
   release.yml                 semver tag + GitHub release from Conventional Commits
   _self_*.yml                 this repo's own callers (CI, CodeQL, release) - not for other repos
