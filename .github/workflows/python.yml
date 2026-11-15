@@ -12,6 +12,13 @@ name: Python
 # seconds of runner time where a Terraform matrix is minutes, so filtering buys
 # little — and always running sidesteps the trap that file documents, where a
 # required check that gets skipped stays pending and blocks the merge.
+#
+# Two optional gates run inside the same job, so turning one on adds no new
+# required check: `typecheck` (a type checker the project pins, e.g. mypy, for
+# the None-handling and wrong-type bugs a suite only catches on the paths it
+# happens to run) and `diff-coverage` (a floor on how much of the code a pull
+# request changes is run by a test). See each input for why it is shaped the
+# way it is.
 on:
   workflow_call:
     inputs:
@@ -42,10 +49,10 @@ on:
       coverage:
         description: >-
           Import package to measure coverage of, e.g. "investagent". Empty
-          disables coverage entirely. Reported into the job summary and never
-          gated: a threshold set here would be a threshold no consuming repo
-          chose, and the honest response to one is usually to mock out whatever
-          is uncovered rather than to test it
+          disables coverage entirely. Reported into the job summary. The total
+          is never gated: a floor on it fails new changes for old code, and the
+          honest response to one is usually to mock out whatever is uncovered
+          rather than to test it. `diff-coverage` gates the PR's own lines
         type: string
         default: ""
       coverage-pr-comment:
@@ -56,6 +63,23 @@ on:
           the comment fails on a 403 while the suite still passes
         type: boolean
         default: false
+      typecheck:
+        description: >-
+          Type-check command to run under `uv run` after the suite, e.g. "mypy".
+          Empty skips it. The checker comes from the project's own locked dev
+          dependencies, never an overlay, so CI and `make typecheck` run the
+          same version with the same config
+        type: string
+        default: ""
+      diff-coverage:
+        description: >-
+          Minimum percentage of the lines a pull request changes in the
+          `coverage` package that the suite must run, e.g. "80". Empty gates
+          nothing. Needs `coverage`. Only the pull request's own lines count,
+          so old untested code never fails a new change, and a pull request
+          that changes no measured code passes
+        type: string
+        default: ""
       postgres:
         description: >-
           Postgres image tag to run for the suite, e.g. "18-alpine". Empty runs
@@ -84,8 +108,31 @@ jobs:
     # down the repository default rather than a read-only token, so callers
     # should set one. Every example in the README does.
     steps:
+      # First, so a misconfigured caller hears in seconds rather than after
+      # the toolchain install and a Postgres start.
+      - name: Check inputs
+        if: ${{ inputs.diff-coverage != '' }}
+        env:
+          COVERAGE: ${{ inputs.coverage }}
+          DIFF_COVERAGE: ${{ inputs.diff-coverage }}
+        run: |
+          if [ -z "$COVERAGE" ]; then
+            echo "::error::diff-coverage needs coverage set to the import package to measure."
+            exit 1
+          fi
+          if ! [[ "$DIFF_COVERAGE" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "::error::diff-coverage must be a plain number such as 80, not '$DIFF_COVERAGE'."
+            exit 1
+          fi
+
+      # Depth 2 on a pull request: the checkout is the merge commit, and its
+      # first parent is the base branch as merged against, which is what
+      # diff-coverage diffs against. One extra commit rather than the whole
+      # history, and the base can't move between checkout and diff.
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 1 }}
 
       # A repo with a mise.toml at its root gets every tool from it, at the
       # versions (and, with a mise.lock, the checksums) it pins; the setup
@@ -157,6 +204,7 @@ jobs:
           exit 1
 
       - name: Run ${{ inputs.command }}
+        id: suite
         working-directory: ${{ inputs.working-directory }}
         env:
           # Through the environment rather than interpolated into the script:
@@ -165,6 +213,7 @@ jobs:
           LOCKED: ${{ inputs.locked }}
           COMMAND: ${{ inputs.command }}
           COVERAGE: ${{ inputs.coverage }}
+          DIFF_COVERAGE: ${{ inputs.diff-coverage }}
         run: |
           args=()
           if [ "$LOCKED" = "true" ]; then
@@ -187,7 +236,33 @@ jobs:
           if [ -n "$COVERAGE" ]; then
             args+=(--with pytest-cov)
             command+=(--cov="$COVERAGE" --cov-report=term-missing)
+            # diff-cover reads Cobertura XML; the terminal report stays as is.
+            if [ -n "$DIFF_COVERAGE" ]; then
+              command+=(--cov-report=xml)
+            fi
           fi
+          uv run "${args[@]}" "${command[@]}"
+
+      # Runs when the suite ran, pass or fail: a failing test and a type error
+      # are separate news, and one run should report both rather than make the
+      # author push twice to find the second. Not after a setup failure, which
+      # would only fail again here with the same cause.
+      - name: Type check
+        if: ${{ !cancelled() && inputs.typecheck != '' && (steps.suite.outcome == 'success' || steps.suite.outcome == 'failure') }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          EXTRAS: ${{ inputs.extras }}
+          LOCKED: ${{ inputs.locked }}
+          TYPECHECK: ${{ inputs.typecheck }}
+        run: |
+          args=()
+          if [ "$LOCKED" = "true" ]; then
+            args+=(--locked)
+          fi
+          for extra in $EXTRAS; do
+            args+=(--extra "$extra")
+          done
+          read -ra command <<< "$TYPECHECK"
           uv run "${args[@]}" "${command[@]}"
 
       # always(), because a failing suite is exactly when the reader wants to
@@ -210,6 +285,45 @@ jobs:
             echo
             cat coverage.md
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # Gates on the pull request's own lines only. A floor on total coverage
+      # fails a new change for old code it never touched, and is cheapest to
+      # meet by mocking whatever is uncovered; on the diff, the cheapest way is
+      # usually to test the code just written. Only after a passing suite: a
+      # failed test leaves coverage that measures nothing.
+      #
+      # Compared with HEAD^1, the merge commit's base-branch parent (checked
+      # out at depth 2 above). diff-cover runs as a uv tool, outside the project
+      # environment it never imports, and is pinned, unlike the pytest-cov
+      # overlay, because its arithmetic decides a required check. Renovate
+      # can't see a pin inside a script, so bump it by hand. Its report is
+      # appended to coverage.md, so the job summary and the PR comment (the
+      # next step) show which changed lines no test runs.
+      - name: Diff coverage
+        if: ${{ !cancelled() && steps.suite.outcome == 'success' && inputs.diff-coverage != '' && github.event_name == 'pull_request' }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          DIFF_COVERAGE: ${{ inputs.diff-coverage }}
+        run: |
+          if [ ! -f coverage.xml ]; then
+            echo "::error::No coverage.xml in ${PWD}. If [tool.coverage.xml] output moves it, drop that setting; diff-coverage reads the default."
+            exit 1
+          fi
+          status=0
+          uv tool run diff-cover@11.0.0 coverage.xml \
+            --compare-branch=HEAD^1 --fail-under="$DIFF_COVERAGE" \
+            --format markdown:diff-coverage.md || status=$?
+          if [ ! -f diff-coverage.md ]; then
+            echo "::error::diff-cover failed before writing a report (exit $status). Its log above has the cause; this is not a coverage result."
+            exit 1
+          fi
+          # diff-cover writes its own "# Diff Coverage" heading.
+          cat diff-coverage.md >> "$GITHUB_STEP_SUMMARY"
+          { echo; cat diff-coverage.md; } >> coverage.md
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Under $DIFF_COVERAGE% of the lines this pull request changes are run by a test. The summary lists them."
+          fi
+          exit "$status"
 
       # A single comment kept up to date, rather than one per push: a PR with
       # twenty commits should carry one coverage table, not twenty. Matched on
