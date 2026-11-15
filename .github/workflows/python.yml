@@ -295,8 +295,8 @@ jobs:
       # Compared with HEAD^1, the merge commit's base-branch parent (checked
       # out at depth 2 above). diff-cover runs as a uv tool, outside the project
       # environment it never imports, and is pinned, unlike the pytest-cov
-      # overlay, because its arithmetic decides a required check. Renovate
-      # can't see a pin inside a script, so bump it by hand. Its report is
+      # overlay, because its arithmetic decides a required check. A regex
+      # manager in renovate.json keeps the pin current. Its report is
       # appended to coverage.md, so the job summary and the PR comment (the
       # next step) show which changed lines no test runs.
       - name: Diff coverage

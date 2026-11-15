@@ -1,6 +1,20 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "autoApprove": true,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "datasourceTemplate": "pypi",
+      "depNameTemplate": "diff-cover",
+      "description": "diff-cover is pinned inside python.yml's Diff coverage script, where no built-in manager looks.",
+      "fileMatch": [
+        "^\\.github/workflows/python\\.yml$"
+      ],
+      "matchStrings": [
+        "uv tool run diff-cover@(?<currentValue>[0-9][^\\s]*)"
+      ]
+    }
+  ],
   "description": "Uses the shared config from jay-withers/renovate. autoApprove lets updates satisfy the branch-protection review requirement so they can auto-merge.",
   "extends": [
     "github>jay-withers/renovate"
