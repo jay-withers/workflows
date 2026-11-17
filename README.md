@@ -171,6 +171,8 @@ jobs:
 | `subscription-id` | `""` | Overrides the environment's `AZURE_SUBSCRIPTION_ID` |
 | `runs-on` | `ubuntu-latest` | Runner label |
 
+Output: `has-changes`, `"true"` when the plan had changes.
+
 Notes:
 
 - Each run shows as a deployment to the environment on the PR or commit, plans included, because that is how GitHub records a job running in an environment. Required reviewers or branch rules on the environment apply to plans too.
@@ -183,7 +185,7 @@ Notes:
 - **Every `TF_VAR_*` Actions variable becomes a Terraform input** for plan and apply, whether set on the job's environment, the repository or the owner. GitHub upper-cases variable names, so the part after the prefix is lower-cased: `TF_VAR_ALERT_EMAIL_ADDRESS` sets `var.alert_email_address`, and a list or object takes HCL/JSON syntax (`["…"]`). Use it for values that identify a person or a subscription, which don't belong in a committed tfvars file. They are variables, not secrets, so they show in the log; never use it for a credential.
 - **A configuration using the github provider** gets `GITHUB_TOKEN` from a `TF_GITHUB_TOKEN` secret on the job's GitHub environment, for plan and apply. Set it on the environment, never as a repository secret, which any branch's run could read. The calling job must pass `secrets: inherit`: without it the called job sees no secrets, its own environment's included, and the provider runs unauthenticated (`403 API rate limit of 60`).
 - **A configuration using the cloudflare provider** gets `CLOUDFLARE_API_TOKEN` from a secret of the same name on the job's GitHub environment, for plan and apply, with the same rules: an environment secret, never a repository one, and `secrets: inherit` on the calling job.
-- **Separate plan and apply identities** (github-repos): PR plans run in an environment holding a read-only identity and token, and the push and manual runs pass `github-environment` naming one with a deployment branch policy of `main` only, which holds the privileged ones. Pending and failed issues stay keyed on `environment`, so they don't split in two.
+- **A privileged, main-only environment** (github-repos, azure-landingzone): their merge plans, manual applies and drift checks pass `environment: dev` with `github-environment: apply`, an environment with a deployment branch policy of `main` only that holds the privileged identity and token. Their PRs get no credentialled plan at all. Pending and failed issues stay keyed on `environment`, so they don't split in two.
 
 ## Terraform unlock
 
@@ -615,7 +617,7 @@ This repo dogfoods its own reusable workflows by calling them with local paths (
 Tools are pinned in [`mise.toml`](mise.toml): set up a machine once with [jay-withers/toolchain](https://github.com/jay-withers/toolchain), then `mise trust && make install` here (it runs `mise install` first, then sets up the git hooks). This repo's own CI installs from the same file. Useful targets:
 
 ```sh
-make install     # install mise tools (mise.toml) and the git hooks
+make install     # install mise tools (mise.toml) and the pre-commit git hook
 make lint        # actionlint (falls back to docker if not installed)
 make pre-commit  # run all pre-commit hooks against the full repo
 ```
