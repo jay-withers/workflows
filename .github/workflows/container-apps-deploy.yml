@@ -387,7 +387,8 @@ jobs:
       ARM_TENANT_ID: ${{ inputs.tenant-id || vars.AZURE_TENANT_ID }}
       ARM_SUBSCRIPTION_ID: ${{ inputs.subscription-id || vars.AZURE_SUBSCRIPTION_ID }}
       # The Playwright the browser check installs and runs (browser-check: true),
-      # passed to scripts/smoke.sh so both use the same one. Bumped by hand.
+      # passed to scripts/smoke.sh so both use the same one. Renovate bumps it
+      # here and smoke.sh's fallback together (renovate.json's custom manager).
       SMOKE_PLAYWRIGHT_VERSION: "1.65.2"
       TF_IN_AUTOMATION: "true"
       TF_INPUT: "0"

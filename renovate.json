@@ -13,6 +13,20 @@
       "matchStrings": [
         "uv tool run diff-cover@(?<currentValue>[0-9][^\\s]*)"
       ]
+    },
+    {
+      "customType": "regex",
+      "datasourceTemplate": "pypi",
+      "depNameTemplate": "playwright",
+      "description": "The browser check's Playwright is pinned in container-apps-deploy.yml's job env and as smoke.sh's fallback, where no built-in manager looks. Both match, so one PR moves them together.",
+      "fileMatch": [
+        "^\\.github/workflows/container-apps-deploy\\.yml$",
+        "^scripts/smoke\\.sh$"
+      ],
+      "matchStrings": [
+        "SMOKE_PLAYWRIGHT_VERSION: \"(?<currentValue>[0-9][^\"]*)\"",
+        "SMOKE_PLAYWRIGHT_VERSION:-(?<currentValue>[0-9][^}]*)\\}"
+      ]
     }
   ],
   "description": "Uses the shared config from jay-withers/renovate. autoApprove lets updates satisfy the branch-protection review requirement so they can auto-merge.",
