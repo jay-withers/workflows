@@ -25,7 +25,11 @@ name: Container Apps deploy
 # the new version is the one serving (or, for a job, the one configured), and
 # a failed deploy or smoke test rolls back to the recorded tag before failing
 # the run. Like the deploy itself, what "healthy" means stays in the caller's
-# Makefile. A repo without the target deploys exactly as before.
+# Makefile. A repo without the target deploys exactly as before. The check
+# itself is this repo's scripts/smoke.sh (v1.30.0+), which each caller's
+# `make smoke` fetches at the commit it pins this workflow to, rather than a
+# copy in every repo. `browser-check: true` adds its Chromium load of each
+# app's home page.
 #
 # Every run, whatever its outcome, then writes one row to the platform's
 # `Deployments_CL` table (azure-container-apps) through the Logs Ingestion API,
@@ -75,6 +79,15 @@ on:
           smoke target exists.
         type: string
         default: deployed-tag
+      browser-check:
+        description: >-
+          Also load each app's home page in Chromium during the smoke test
+          (SMOKE_BROWSER=1 for scripts/smoke.sh, v1.30.0+): it must end on a
+          200 with no console error, so a broken template or a CSP block rolls
+          the release back. Unauthenticated, and not on a rollback. The
+          workflow installs uv and Chromium itself, before the deploy.
+        type: boolean
+        default: false
       rollback:
         description: >-
           Redeploy the version that was live when the deploy or smoke test
@@ -373,6 +386,9 @@ jobs:
       ARM_CLIENT_ID: ${{ inputs.client-id || vars.AZURE_CLIENT_ID }}
       ARM_TENANT_ID: ${{ inputs.tenant-id || vars.AZURE_TENANT_ID }}
       ARM_SUBSCRIPTION_ID: ${{ inputs.subscription-id || vars.AZURE_SUBSCRIPTION_ID }}
+      # The Playwright the browser check installs and runs (browser-check: true),
+      # passed to scripts/smoke.sh so both use the same one. Bumped by hand.
+      SMOKE_PLAYWRIGHT_VERSION: "1.65.2"
       TF_IN_AUTOMATION: "true"
       TF_INPUT: "0"
     steps:
@@ -514,6 +530,18 @@ jobs:
           tenant-id: ${{ env.ARM_TENANT_ID }}
           subscription-id: ${{ env.ARM_SUBSCRIPTION_ID }}
 
+      # Before the deploy, so a flaky mirror or CDN fails the run with
+      # nothing changed, rather than failing a smoke test and rolling back a
+      # good release. `--with-deps` brings Chromium's apt libraries, which
+      # needs the runner's sudo; smoke.sh itself never installs them.
+      - name: Setup uv for the browser check
+        if: inputs.browser-check
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Install Chromium for the browser check
+        if: inputs.browser-check
+        run: uvx --from "playwright==$SMOKE_PLAYWRIGHT_VERSION" playwright install --with-deps chromium
+
       - name: Check for a smoke test
         id: smoke
         env:
@@ -555,6 +583,7 @@ jobs:
           SMOKE_TARGET: ${{ inputs.smoke-target }}
           SMOKE: ${{ steps.smoke.outputs.enabled }}
           ROLLBACK: ${{ inputs.rollback }}
+          BROWSER_CHECK: ${{ inputs.browser-check }}
           PREVIOUS: ${{ steps.live.outputs.tag }}
           VERSION: ${{ inputs.version }}
           TF_ENVIRONMENT: ${{ inputs.environment }}
@@ -562,13 +591,25 @@ jobs:
           # SMOKE_PHASE tells the smoke target which kind of deploy it checks. On
           # a rollback it can skip what the old image may predate or what costs
           # time while dev is down (a selfcheck run of each job, say): that
-          # image has already run here.
+          # image has already run here. SMOKE_BROWSER asks scripts/smoke.sh
+          # for its browser check, which it skips on a rollback itself.
+          browser=0
+          [ "$BROWSER_CHECK" != true ] || browser=1
+          # smoke.sh (v1.30.0+) touches this when its browser check passes. A
+          # smoke target still running an older copy ignores SMOKE_BROWSER, and
+          # without the marker that would look exactly like a passed check.
+          export SMOKE_BROWSER_MARKER="$RUNNER_TEMP/smoke-browser-ran"
+          rm -f "$SMOKE_BROWSER_MARKER"
           deploy() {
             make "$TARGET" IMAGE_TAG="$1" ENV="$TF_ENVIRONMENT" || return 1
-            [ "$SMOKE" != true ] || SMOKE_PHASE="$2" make "$SMOKE_TARGET" IMAGE_TAG="$1" ENV="$TF_ENVIRONMENT"
+            [ "$SMOKE" != true ] ||
+              SMOKE_PHASE="$2" SMOKE_BROWSER="$browser" make "$SMOKE_TARGET" IMAGE_TAG="$1" ENV="$TF_ENVIRONMENT"
           }
 
           if deploy "$VERSION" release; then
+            if [ "$SMOKE" = true ] && [ "$browser" = 1 ] && [ ! -e "$SMOKE_BROWSER_MARKER" ]; then
+              echo "::warning::browser-check is on, but the '$SMOKE_TARGET' target ran no browser check. It is probably running its own copy of smoke.sh rather than this repo's scripts/smoke.sh (v1.30.0+)."
+            fi
             if [ "$SMOKE" = true ]; then
               echo "result=success" >> "$GITHUB_OUTPUT"
               echo "Deployed and smoke-tested \`$VERSION\` on \`$TF_ENVIRONMENT\`." >> "$GITHUB_STEP_SUMMARY"
