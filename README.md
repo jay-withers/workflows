@@ -271,6 +271,7 @@ jobs:
 | `target` | `deploy` | Make target to run |
 | `smoke-target` | `smoke` | Make target proving the deployed version works. Skipped when the Makefile has no such target; empty disables it |
 | `live-target` | `deployed-tag` | Make target printing the live image tag (last line of stdout), recorded before the deploy as the rollback version |
+| `browser-check` | `false` | (v1.30.0+) Installs uv and Chromium before the deploy, then passes `SMOKE_BROWSER=1` to the smoke target, so `scripts/smoke.sh` also loads each app's home page in Chromium: a 200 with no console error (a failed favicon load aside), or the release rolls back. Unauthenticated; skipped on a rollback. Warns if the smoke target ran no browser check (an old copy of smoke.sh) |
 | `rollback` | `true` | On a failed deploy or smoke test, redeploy the recorded version. The run still fails |
 | `client-id` | `""` | Overrides the environment's `AZURE_CLIENT_ID` |
 | `tenant-id` | `""` | Overrides the environment's `AZURE_TENANT_ID` |
@@ -295,6 +296,20 @@ Notes:
   - `deployed-tag` prints the tag currently configured (for example the part after `:` in the app's image) and exits 0, printing nothing on a first deploy.
   - `smoke` exits non-zero unless `IMAGE_TAG` is what's running. For an app, poll its default FQDN until a `/healthz`-style endpoint reports `IMAGE_TAG` and readiness passes, allowing for a cold start. For a job, check its configured image; don't start it, since running a job has side effects.
   - `smoke` runs with `SMOKE_PHASE=release` after the deploy and `SMOKE_PHASE=rollback` after a rollback, so it can skip on a rollback what an older image may predate, or what only slows restoring service (starting a self-check run of each job, for example).
+  - **(v1.30.0+) Use this repo's [`scripts/smoke.sh`](scripts/smoke.sh)** rather than a copy: it implements exactly the above (`smoke.sh <tag> <resource-group> <image-without-tag> app:<name>... job:<name>...`, with a `selfcheck` run of each job). Fetch it in the `smoke` target at the commit your cd-publish pins this workflow to, so CI and a local `make smoke` run the same version and Renovate's pin bump moves it:
+
+    ```make
+    WORKFLOWS_SHA = $(shell sed -n 's|.*container-apps-deploy\.yml@\([0-9a-f]\{40\}\).*|\1|p' .github/workflows/cd-publish.yml | head -n 1)
+    SMOKE_SH_URL = https://raw.githubusercontent.com/jay-withers/workflows/$(WORKFLOWS_SHA)/scripts/smoke.sh
+
+    smoke:
+    	@[ -n "$(WORKFLOWS_SHA)" ] || { echo "smoke: no container-apps-deploy.yml@<sha> pin in cd-publish.yml" >&2; exit 1; }
+    	@script="$$(mktemp)"; trap 'rm -f "$$script"' EXIT; \
+    	curl -fsSL --retry 3 -o "$$script" "$(SMOKE_SH_URL)" || { echo "smoke: can't fetch $(SMOKE_SH_URL)" >&2; exit 1; }; \
+    	bash "$$script" $(IMAGE_TAG) <resource-group> <image-without-tag> app:<name> job:<name>
+    ```
+
+    With `SMOKE_BROWSER=1` (`browser-check: true`) it also loads each app's `/` in Chromium (Playwright, pinned in the script) once `/readyz` passes, and fails on anything but a 200 or on any console error. For a passcode-gated app that is the login page under the real deployed headers, so a broken template or a CSP block rolls back. It never signs in, so no app secret reaches CI.
   - Rolling back redeploys an image, nothing else. A release whose data or schema change the previous version can't read must not rely on it.
 - **Every run records a deploy event**, whatever its outcome: one row in the platform's `Deployments_CL` table (azure-container-apps), posted through the Logs Ingestion API with the run's own Azure login. Columns: `Repo`, `App`, `Environment`, `Version`, `PreviousVersion` (the recorded live tag), `Outcome` (`success`, `untested` when there's no smoke target, `rolled_back` or `failed`), `Trigger` (`renovate` when the released commit is Renovate's, `redeploy` when the run was started by hand to redeploy an existing tag that wasn't held, else `manual`), `CommitSha`, `RunUrl` and `LeadTimeSec` (commit to live; empty for a redeploy). It needs `EVENTS_INGESTION_ENDPOINT` and `EVENTS_DCR_IMMUTABLE_ID` on the environment and `Monitoring Metrics Publisher` on the events rule, all set by github-repos; without the variables the step is skipped with a notice. A post that fails turns the run red, after the issue step, so it never reads as a failed deploy. The Environments page needs no extra step: a job running in a GitHub environment already records a deployment there.
 - **A failed deploy opens an issue** labelled `deploy-failed`, @-mentioning the repo owner and linking the run; a repeat failure comments on it and the next success closes it. GitHub emails a failed run only to whoever triggered it, and Renovate's auto-merges trigger most deploys, so without this nobody hears. The caller must grant `issues: write` (and `cd-tag` too, when it calls `cd-publish`); without it the step only warns.

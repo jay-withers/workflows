@@ -9,8 +9,8 @@ The reusable GitHub Actions workflows behind every `ci-*` and `cd-*` workflow
 in every `jay-withers` repo. Callers are thin: they pick a workflow here, pass
 inputs and grant permissions. How a job *works* (plan, apply, build, scan,
 deploy, smoke test, roll back, tag) lives here, so a change made once reaches
-every repo. Only what is specific to one repo (its `make deploy`, its
-`scripts/smoke.sh`, which images it builds) stays in that repo.
+every repo. Only what is specific to one repo (its `make deploy`, which apps
+and jobs its `make smoke` checks, which images it builds) stays in that repo.
 
 [README.md](README.md) is the reference: one section per workflow, with a
 caller example, every input, and the notes on what each one needs. The
@@ -32,7 +32,14 @@ is `docs/delivery.md` in `jay-withers/factory`.
   codeql.yml                  CodeQL per language
   release.yml                 semver tag + GitHub release from Conventional Commits
   _self_*.yml                 this repo's own callers (CI, CodeQL, release) - not for other repos
+scripts/
+  smoke.sh                    the post-deploy smoke test every app's `make smoke` fetches at its pinned SHA
 ```
+
+`scripts/smoke.sh` is consumed at the commit each caller pins
+`container-apps-deploy.yml` to, so it follows the same rules as a workflow:
+stay backward compatible, and gate new behaviour behind an environment
+variable that defaults to today's (as `SMOKE_BROWSER` does).
 
 Each workflow opens with a long header comment explaining *why* it is built
 the way it is. Read it before changing the workflow, and keep it current.
