@@ -290,9 +290,23 @@ jobs:
 
           if [ "$EVENT" = "workflow_dispatch" ] || [ "$ATTEMPT" -gt 1 ]; then
             echo "deploy=true" >> "$GITHUB_OUTPUT"
-            # Deploying the held tag resolves the issue once it succeeds.
-            if [ -n "$number" ] && [ "$held" = "$version" ]; then
-              echo "resolves=$number" >> "$GITHUB_OUTPUT"
+            # Deploying the held tag, or a later one that contains it,
+            # resolves the issue once it succeeds. A release only moves the
+            # hold when it publishes, so a release that skipped publishing
+            # (nothing in the image changed) leaves the issue naming an older
+            # tag than the newest one, which is the one people deploy.
+            if [ -n "$number" ] && [ -n "$held" ]; then
+              if [ "$held" = "$version" ]; then
+                echo "resolves=$number" >> "$GITHUB_OUTPUT"
+              else
+                # "ahead": version is held plus more commits. Anything else
+                # (behind, diverged, an unreadable compare) leaves it open.
+                status="$(gh api "repos/$REPOSITORY/compare/$held...$version" --jq .status 2>/dev/null)" || status=""
+                if [ "$status" = ahead ]; then
+                  echo "resolves=$number" >> "$GITHUB_OUTPUT"
+                  echo "\`$version\` contains the held \`$held\`, so deploying it resolves #$number." >> "$GITHUB_STEP_SUMMARY"
+                fi
+              fi
             fi
             exit 0
           fi
