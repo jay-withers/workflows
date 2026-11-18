@@ -89,6 +89,17 @@ on:
           a clone with no Docker
         type: string
         default: ""
+      playwright:
+        description: >-
+          Install Playwright's Chromium (and the system libraries it needs)
+          before the suite, so browser tests run inside this same job and need
+          no new required check. Playwright itself comes from the project's own
+          locked dependencies (pytest-playwright in its dev extra); the browser
+          download is cached per Playwright version. Tests should skip when the
+          browser is missing locally but fail under CI, so a broken install
+          never passes as skipped
+        type: boolean
+        default: false
       runs-on:
         description: Runner label
         type: string
@@ -202,6 +213,58 @@ jobs:
           echo "::error::Postgres did not become ready within 60s"
           docker logs ci-postgres >&2
           exit 1
+
+      # Keyed on the Playwright version the project locks, because each release
+      # pins its own browser build: a cache from another version is a miss
+      # that `playwright install` would download over anyway.
+      - name: Detect Playwright version
+        id: playwright
+        if: ${{ inputs.playwright }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          EXTRAS: ${{ inputs.extras }}
+          LOCKED: ${{ inputs.locked }}
+        run: |
+          args=()
+          if [ "$LOCKED" = "true" ]; then
+            args+=(--locked)
+          fi
+          for extra in $EXTRAS; do
+            args+=(--extra "$extra")
+          done
+          version="$(uv run "${args[@]}" python -c \
+            'import importlib.metadata as m; print(m.version("playwright"))')" || {
+            echo "::error::playwright: true, but the project's environment has no playwright. Add pytest-playwright to the extra named in extras."
+            exit 1
+          }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        if: ${{ inputs.playwright }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright.outputs.version }}
+
+      # --with-deps on every run, cache hit or not: the cache holds the browser,
+      # not the apt packages it links against (libnss3, libasound2...), and a
+      # fresh runner has neither. With the browser cached this is the apt step
+      # alone.
+      - name: Install Playwright Chromium
+        if: ${{ inputs.playwright }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          EXTRAS: ${{ inputs.extras }}
+          LOCKED: ${{ inputs.locked }}
+        run: |
+          args=()
+          if [ "$LOCKED" = "true" ]; then
+            args+=(--locked)
+          fi
+          for extra in $EXTRAS; do
+            args+=(--extra "$extra")
+          done
+          uv run "${args[@]}" playwright install --with-deps chromium
 
       - name: Run ${{ inputs.command }}
         id: suite
