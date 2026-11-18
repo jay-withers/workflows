@@ -106,8 +106,16 @@ jobs:
           fi
           pre-commit --version
 
+      # tflint --init looks each plugin's release up through the GitHub API.
+      # Anonymous, that is 60 requests an hour per IP, shared by every job on
+      # a hosted runner's address, so other people's jobs can use it up
+      # (403 "API rate limit exceeded"). With GITHUB_TOKEN it counts against
+      # this repository's own allowance instead. Reading public releases needs
+      # no extra permission.
       - name: Initialise TFLint plugins
         if: inputs.terraform
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           if [ -f "${{ inputs.tflint-config }}" ]; then
             tflint --init --config "${{ inputs.tflint-config }}"

@@ -26,7 +26,7 @@ What each workflow then needs from `mise.toml`, failing with an error naming the
 | `pre-commit.yml` | `pre-commit`, plus whatever your hooks call: with `terraform: true`, `terraform`, `tflint`, `terraform-docs` and `checkov` | `python-version`, `node-version`, `terraform-version`, `terraform-docs-version`, `checkov-version` |
 | `python.yml` | `uv`, and `python` to choose the interpreter (exported as `UV_PYTHON`; without it uv picks one itself) | `python-version` |
 
-`terraform.yml`'s change filter counts `mise.toml` as a Terraform change (v1.26.1+), so a Terraform bump there is validated. `tflint --init` still runs with `terraform: true`. A repo without `mise.toml` sees no change. Renovate's shared `mise` preset keeps the versions current.
+`terraform.yml`'s change filter counts `mise.toml` as a Terraform change (v1.26.1+), so a Terraform bump there is validated. `tflint --init` still runs with `terraform: true`, authenticated with the job's token (v1.31.1+), so a hosted runner's shared anonymous GitHub API limit can't fail it. A repo without `mise.toml` sees no change. Renovate's shared `mise` preset keeps the versions current.
 
 ## Terraform CI
 
