@@ -101,7 +101,7 @@ There is no test suite. Before opening a PR:
   `gh` on `PATH`, a sample plan or lock file), one case per branch of the
   logic, and list the cases in the PR.
 - For a behaviour change, say which caller should take the new pin first.
-  A good pilot is gym-log, the reference app repo the others copy from.
+  A good pilot is health, the reference app repo the others copy from.
 
 ## Commands
 
