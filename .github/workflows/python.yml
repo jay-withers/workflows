@@ -373,7 +373,7 @@ jobs:
             exit 1
           fi
           status=0
-          uv tool run diff-cover@11.0.1 coverage.xml \
+          uv tool run diff-cover@11.0.4 coverage.xml \
             --compare-branch=HEAD^1 --fail-under="$DIFF_COVERAGE" \
             --format markdown:diff-coverage.md || status=$?
           if [ ! -f diff-coverage.md ]; then
