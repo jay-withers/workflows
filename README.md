@@ -5,7 +5,7 @@ Reusable GitHub Actions workflows, called from other repositories via `workflow_
 | Workflow | Purpose |
 | --- | --- |
 | [`terraform.yml`](.github/workflows/terraform.yml) | Terraform CI: credential-free init, validate and optional `terraform test` across one or more root modules |
-| [`terraform-deploy.yml`](.github/workflows/terraform-deploy.yml) | Terraform CD: OIDC to Azure, plan one root module for one environment, and optionally apply the saved plan |
+| [`terraform-deploy.yml`](.github/workflows/terraform-deploy.yml) | Terraform CD: OIDC to Azure (or Google Cloud), plan one root module for one environment, and optionally apply the saved plan |
 | [`terraform-unlock.yml`](.github/workflows/terraform-unlock.yml) | Run by hand: releases a stuck Terraform state lock with `terraform force-unlock`, as the same identity the plan uses |
 | [`container-apps-deploy.yml`](.github/workflows/container-apps-deploy.yml) | App CD: OIDC to Azure, then the caller's own `make deploy IMAGE_TAG=<version>` rolls a published image onto its Container Apps workloads |
 | [`pre-commit.yml`](.github/workflows/pre-commit.yml) | Runs all pre-commit hooks against the full repository |
@@ -84,13 +84,15 @@ Notes:
 
 ## Terraform deploy
 
-Plans one root module against one environment with Azure credentials, and optionally applies the saved plan in the same job. A PR and a merge call it with `apply: false`; applying is a manual run with `apply: true`. Apply runs the exact plan printed above it, and is skipped when the plan has no changes.
+Plans one root module against one environment with Azure credentials (or, with `cloud: gcp`, Google Cloud ones), and optionally applies the saved plan in the same job. A PR and a merge call it with `apply: false`; applying is a manual run with `apply: true`. Apply runs the exact plan printed above it, and is skipped when the plan has no changes.
 
 On a pull request, the plan is posted as a PR comment: one per directory and environment, edited in place on every push, with a one-line summary (`Plan: 1 to add, 0 to change, 0 to destroy.`) and the full plan behind a collapsible section.
 
 **Infrastructure changes wait for a human, not for a label.** A PR plan fails only when the plan errors; deletes and replaces are called out in the comment. On merge, call it with `apply: false`: a plan with changes then opens a `terraform-pending` issue (one per directory and environment) with the plan summary and any deletes or replaces. Creating it emails the repo owner, and repo-agent's weekly digest lists the open ones. To apply, run the caller by hand with `apply: true` (`cd-terraform`'s `workflow_dispatch`). That run, or any later plan with no changes, closes the issue. Later merges only refresh the issue body, so it doesn't email on every merge. Needs `issues: write`; without it the step warns.
 
 The job runs in the GitHub environment named by `environment` and reads `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_SUBSCRIPTION_ID` from that environment's variables. Authentication is GitHub OIDC, and because the job is in an environment, the token's subject is `<repo prefix>:environment:<environment>` for plans and applies alike. The identity needs one federated credential with that subject per environment. Read the repo prefix from `gh api repos/<owner>/<repo>/actions/oidc/customization/sub` (`sub_claim_prefix`): newer repos use immutable subjects such as `repo:owner@123/repo@456`, not `repo:owner/repo`.
+
+**Google Cloud** (v1.32.0+): with `cloud: gcp` the same GitHub OIDC token is exchanged for Google credentials through Workload Identity Federation ([`google-github-actions/auth`](https://github.com/google-github-actions/auth)), from the environment's `GCP_WORKLOAD_IDENTITY_PROVIDER` (the provider's full name) and, optionally, `GCP_SERVICE_ACCOUNT`. With a service account, its `roles/iam.workloadIdentityUser` binding must name the job's subject (`principal://iam.googleapis.com/projects/<project number>/locations/global/workloadIdentityPools/<pool>/subject/<repo prefix>:environment:<environment>`); without one, the roles are granted to that `principal://` directly. Nothing else changes: same environments, same `id-token: write`, and a `gcs` backend in `backends/<environment>.hcl` or the root's own backend block. The drift event is Azure-only, so a GCP drift check writes its status to the job summary and warns when it finds drift.
 
 ```yaml
 # Plan on PR (the caller's ci-terraform)
@@ -166,6 +168,9 @@ jobs:
 | `directory` | `terraform` | Root-module directory, relative to the repo root |
 | `apply` | `false` | Apply the saved plan when it has changes. Refused on `pull_request` |
 | `drift` | `false` | Nightly drift check: plan only, record `ok`/`drifted`/`pending`/`failed` as an `OpsEvents_CL` row, never touch `terraform-pending` issues. Refused with `apply` |
+| `cloud` | `azure` | `gcp` (v1.32.0+) signs in to Google Cloud through Workload Identity Federation instead of Azure |
+| `workload-identity-provider` | `""` | With `cloud: gcp`, overrides the environment's `GCP_WORKLOAD_IDENTITY_PROVIDER` |
+| `service-account` | `""` | With `cloud: gcp`, overrides the environment's `GCP_SERVICE_ACCOUNT`. Neither set uses the federated identity directly |
 | `client-id` | `""` | Overrides the environment's `AZURE_CLIENT_ID` |
 | `tenant-id` | `""` | Overrides the environment's `AZURE_TENANT_ID` |
 | `subscription-id` | `""` | Overrides the environment's `AZURE_SUBSCRIPTION_ID` |
@@ -227,12 +232,16 @@ jobs:
 | `github-environment` | `""` | Runs the job in this GitHub environment instead of `environment` (github-repos: `apply`) |
 | `environment-files` | `true` | `false` inits with the root's own backend block |
 | `directory` | `terraform` | Root-module directory, relative to the repo root |
+| `cloud` | `azure` | `gcp` (v1.32.0+), as in Terraform deploy |
+| `workload-identity-provider` | `""` | With `cloud: gcp`, overrides the environment's `GCP_WORKLOAD_IDENTITY_PROVIDER` |
+| `service-account` | `""` | With `cloud: gcp`, overrides the environment's `GCP_SERVICE_ACCOUNT` |
 | `runs-on` | `ubuntu-latest` | Runner label |
 
 Notes:
 
 - No new grant: breaking the lease is a write on the state container, which
-  the plan identity's Storage Blob Data Contributor already covers.
+  the plan identity's Storage Blob Data Contributor already covers. On GCP,
+  the lock is an object beside the state, under the same prefix grant.
 - **It refuses while another Terraform run is in progress** in the repo (any
   workflow named with `terraform` or `drift`), since force-unlocking under a
   live apply corrupts state. That check needs `actions: read`; without it the

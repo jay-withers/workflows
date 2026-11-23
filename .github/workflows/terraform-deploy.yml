@@ -1,7 +1,8 @@
 name: Terraform deploy
 
 # Credentialled plan, and optionally apply, of one root module against one
-# environment, authenticating to Azure with GitHub OIDC.
+# environment, authenticating with GitHub OIDC: to Azure by default, or to
+# Google Cloud through Workload Identity Federation with `cloud: gcp`.
 #
 # One workflow rather than a plan one and an apply one, for the same reason as
 # docker.yml: a PR, a merge and a manual apply all run the same init and plan,
@@ -14,9 +15,10 @@ name: Terraform deploy
 # no changes.
 #
 # The job runs in the GitHub environment named by `environment`, for two
-# reasons. The Azure identity's details live there as environment variables
-# (AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID), which only a job
-# in that environment can read. And the OIDC token's subject becomes
+# reasons. The identity's details live there as environment variables
+# (AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID; or, with
+# `cloud: gcp`, GCP_WORKLOAD_IDENTITY_PROVIDER and GCP_SERVICE_ACCOUNT), which
+# only a job in that environment can read. And the OIDC token's subject becomes
 # `<repo prefix>:environment:<environment>` for plans and applies alike, so one
 # federated credential per environment covers both.
 #
@@ -36,6 +38,11 @@ name: Terraform deploy
 # plan with changes while this directory and environment's `terraform-pending`
 # issue is open: a merged change waiting to be applied, which that issue
 # already reports, so the alert leaves it alone.
+#
+# The drift event goes to Azure's Logs Ingestion API, so it is recorded only
+# for `cloud: azure` where the environment has the EVENTS_* variables. A GCP
+# configuration's drift check writes its status to the job summary, and
+# warns when it finds drift, instead.
 #
 # This is deliberately separate from terraform.yml, which stays credential-free:
 # a plan needs an identity with read on everything the configuration touches
@@ -88,6 +95,30 @@ on:
           Refused together with `apply`.
         type: boolean
         default: false
+      cloud:
+        description: >-
+          Where the configuration's state and resources are: `azure` (the
+          default) logs in to Azure with OIDC from the environment's
+          AZURE_* variables; `gcp` (v1.32.0+) exchanges the same GitHub OIDC
+          token for Google credentials through Workload Identity Federation,
+          from its GCP_* variables.
+        type: string
+        default: azure
+      workload-identity-provider:
+        description: >-
+          With `cloud: gcp`, overrides the environment's
+          GCP_WORKLOAD_IDENTITY_PROVIDER variable: the provider's full name,
+          `projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>`.
+        type: string
+        default: ""
+      service-account:
+        description: >-
+          With `cloud: gcp`, overrides the environment's GCP_SERVICE_ACCOUNT
+          variable. Empty (and no variable) uses the federated identity
+          directly, with no service account in between, for an environment
+          whose roles are granted to its `principal://` subject.
+        type: string
+        default: ""
       client-id:
         description: >-
           Overrides the environment's AZURE_CLIENT_ID variable. Leave empty to
@@ -170,7 +201,18 @@ jobs:
           echo "::error::apply: true and drift: true are mutually exclusive."
           exit 1
 
+      - name: Check the cloud input
+        working-directory: .
+        env:
+          CLOUD: ${{ inputs.cloud }}
+        run: |
+          case "$CLOUD" in
+            azure|gcp) ;;
+            *) echo "::error::cloud must be azure or gcp, not '$CLOUD'."; exit 1 ;;
+          esac
+
       - name: Check Azure settings
+        if: inputs.cloud == 'azure'
         working-directory: .
         env:
           INPUT_ENVIRONMENT: ${{ inputs.github-environment || inputs.environment }}
@@ -181,6 +223,18 @@ jobs:
               exit 1
             fi
           done
+
+      - name: Check GCP settings
+        if: inputs.cloud == 'gcp'
+        working-directory: .
+        env:
+          PROVIDER: ${{ inputs.workload-identity-provider || vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          INPUT_ENVIRONMENT: ${{ inputs.github-environment || inputs.environment }}
+        run: |
+          if [ -z "$PROVIDER" ]; then
+            echo "::error::GCP_WORKLOAD_IDENTITY_PROVIDER is empty. Set it as a variable on the '$INPUT_ENVIRONMENT' environment, or pass workload-identity-provider."
+            exit 1
+          fi
 
       # Every TF_VAR_* Actions variable (environment, repository or owner)
       # becomes a Terraform input, so values that identify a person or a
@@ -207,6 +261,18 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # After checkout, because the action writes a credentials file into the
+      # workspace (and exports GOOGLE_APPLICATION_CREDENTIALS, which the gcs
+      # backend and the google provider both read), and checkout would remove
+      # it. The GitHub OIDC token it exchanges is the same one the Azure path
+      # uses, so the caller's `id-token: write` covers both.
+      - name: Authenticate to Google Cloud
+        if: inputs.cloud == 'gcp'
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ inputs.workload-identity-provider || vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ inputs.service-account || vars.GCP_SERVICE_ACCOUNT }}
 
       # A repo with a mise.toml at its root gets every tool from it, at the
       # versions (and, with a mise.lock, the checksums) it pins; the setup
@@ -498,7 +564,7 @@ jobs:
       # The drift check's only output. Plan ran with OIDC env vars, not an az
       # session, so this logs in just to get a token for the ingestion API.
       - name: Azure login for the drift event
-        if: always() && inputs.drift && vars.EVENTS_INGESTION_ENDPOINT != '' && vars.EVENTS_DCR_IMMUTABLE_ID != ''
+        if: always() && inputs.drift && inputs.cloud == 'azure' && vars.EVENTS_INGESTION_ENDPOINT != '' && vars.EVENTS_DCR_IMMUTABLE_ID != ''
         uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
         with:
           client-id: ${{ env.ARM_CLIENT_ID }}
@@ -519,17 +585,13 @@ jobs:
           MARKER: "<!-- terraform-pending:${{ inputs.directory }}:${{ inputs.environment }} -->"
           ENDPOINT: ${{ vars.EVENTS_INGESTION_ENDPOINT }}
           DCR_ID: ${{ vars.EVENTS_DCR_IMMUTABLE_ID }}
+          CLOUD: ${{ inputs.cloud }}
           REPOSITORY: ${{ github.repository }}
           TF_ENVIRONMENT: ${{ inputs.environment }}
           DIRECTORY: ${{ inputs.directory }}
           HAS_CHANGES: ${{ steps.plan.outputs.has-changes }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          if [ -z "$ENDPOINT" ] || [ -z "$DCR_ID" ]; then
-            echo "::notice::EVENTS_INGESTION_ENDPOINT or EVENTS_DCR_IMMUTABLE_ID is not set on this job's environment, so this drift check is not recorded."
-            exit 0
-          fi
-
           repo="${REPOSITORY#*/}"
           case "$HAS_CHANGES" in
             false) status=ok detail="No changes." ;;
@@ -544,6 +606,20 @@ jobs:
               fi ;;
             *) status=failed detail="The plan did not complete." ;;
           esac
+          echo "Drift check: \`$status\`. $detail" >> "$GITHUB_STEP_SUMMARY"
+
+          # The event table is Azure's. Elsewhere the summary above and a
+          # warning are the record; a failed plan has already failed the job.
+          if [ "$CLOUD" != "azure" ]; then
+            if [ "$status" = "drifted" ]; then
+              echo "::warning::Drift: $detail"
+            fi
+            exit 0
+          fi
+          if [ -z "$ENDPOINT" ] || [ -z "$DCR_ID" ]; then
+            echo "::notice::EVENTS_INGESTION_ENDPOINT or EVENTS_DCR_IMMUTABLE_ID is not set on this job's environment, so this drift check is not recorded."
+            exit 0
+          fi
 
           row="$(jq -cn \
             --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \

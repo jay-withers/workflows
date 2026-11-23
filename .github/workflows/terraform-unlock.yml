@@ -6,10 +6,12 @@ name: Terraform unlock
 # state lock" and prints the lock ID this needs.
 #
 # Run by hand only: callers wrap it in a `workflow_dispatch` taking the lock ID.
-# It logs in exactly as terraform-deploy.yml does, in the same GitHub
-# environment, so it needs no grant beyond what the plan already has:
-# breaking the blob lease is a write on the state container, which the
-# identity's Storage Blob Data Contributor covers.
+# It logs in as terraform-deploy.yml does, in the same GitHub environment and
+# to the same `cloud`, from that environment's variables (it has
+# terraform-deploy's GCP override inputs, not its Azure ones), so it needs no
+# grant beyond what the
+# plan already has: breaking the blob lease (or deleting the gcs backend's
+# lock object) is a write on the state, which the plan's identity holds.
 #
 # Force-unlocking under a run that is still going corrupts state, so before
 # unlocking it refuses while another Terraform run (a workflow whose name has
@@ -43,6 +45,18 @@ on:
         description: Root-module directory, relative to the repository root.
         type: string
         default: terraform
+      cloud:
+        description: "`azure` (the default) or `gcp` (v1.32.0+), as in terraform-deploy.yml."
+        type: string
+        default: azure
+      workload-identity-provider:
+        description: "With `cloud: gcp`, overrides the environment's GCP_WORKLOAD_IDENTITY_PROVIDER variable."
+        type: string
+        default: ""
+      service-account:
+        description: "With `cloud: gcp`, overrides the environment's GCP_SERVICE_ACCOUNT variable. Empty (and no variable) uses the federated identity directly."
+        type: string
+        default: ""
       runs-on:
         description: Runner label.
         type: string
@@ -82,11 +96,23 @@ jobs:
         working-directory: .
         env:
           INPUT_ENVIRONMENT: ${{ inputs.github-environment || inputs.environment }}
+          CLOUD: ${{ inputs.cloud }}
+          PROVIDER: ${{ inputs.workload-identity-provider || vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
         run: |
           if ! [[ "$LOCK_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
             echo "::error::lock-id must be the UUID from Terraform's lock error."
             exit 1
           fi
+          case "$CLOUD" in
+            azure) ;;
+            gcp)
+              if [ -z "$PROVIDER" ]; then
+                echo "::error::GCP_WORKLOAD_IDENTITY_PROVIDER is empty. Set it as a variable on the '$INPUT_ENVIRONMENT' environment, or pass workload-identity-provider."
+                exit 1
+              fi
+              exit 0 ;;
+            *) echo "::error::cloud must be azure or gcp, not '$CLOUD'."; exit 1 ;;
+          esac
           for v in ARM_CLIENT_ID ARM_TENANT_ID ARM_SUBSCRIPTION_ID; do
             if [ -z "${!v}" ]; then
               echo "::error::$v is empty. Set AZURE_${v#ARM_} as a variable on the '$INPUT_ENVIRONMENT' environment."
@@ -114,6 +140,18 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # After checkout, because the action writes a credentials file into the
+      # workspace (and exports GOOGLE_APPLICATION_CREDENTIALS, which the gcs
+      # backend and the google provider both read), and checkout would remove
+      # it. The GitHub OIDC token it exchanges is the same one the Azure path
+      # uses, so the caller's `id-token: write` covers both.
+      - name: Authenticate to Google Cloud
+        if: inputs.cloud == 'gcp'
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ inputs.workload-identity-provider || vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ inputs.service-account || vars.GCP_SERVICE_ACCOUNT }}
 
       # A repo with a mise.toml at its root gets every tool from it, at the
       # versions (and, with a mise.lock, the checksums) it pins; the setup
