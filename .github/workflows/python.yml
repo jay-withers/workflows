@@ -13,12 +13,14 @@ name: Python
 # little — and always running sidesteps the trap that file documents, where a
 # required check that gets skipped stays pending and blocks the merge.
 #
-# Two optional gates run inside the same job, so turning one on adds no new
-# required check: `typecheck` (a type checker the project pins, e.g. mypy, for
-# the None-handling and wrong-type bugs a suite only catches on the paths it
-# happens to run) and `diff-coverage` (a floor on how much of the code a pull
-# request changes is run by a test). See each input for why it is shaped the
-# way it is.
+# Optional gates run inside the same job, so turning one on adds no new
+# required check: `lint` (ruff check and ruff format --check, from the
+# project's own locked dev dependencies), `typecheck` (a type checker the
+# project pins, e.g. mypy, for the None-handling and wrong-type bugs a suite
+# only catches on the paths it happens to run), `coverage-min` (a floor on
+# the package's total) and `diff-coverage` (a floor on how much of the code a
+# pull request changes is run by a test). See each input for why it is shaped
+# the way it is.
 on:
   workflow_call:
     inputs:
@@ -49,10 +51,9 @@ on:
       coverage:
         description: >-
           Import package to measure coverage of, e.g. "investagent". Empty
-          disables coverage entirely. Reported into the job summary. The total
-          is never gated: a floor on it fails new changes for old code, and the
-          honest response to one is usually to mock out whatever is uncovered
-          rather than to test it. `diff-coverage` gates the PR's own lines
+          disables coverage entirely. Reported into the job summary, and gated
+          only by `coverage-min` (the total) and `diff-coverage` (the PR's own
+          lines)
         type: string
         default: ""
       coverage-pr-comment:
@@ -69,6 +70,21 @@ on:
           Empty skips it. The checker comes from the project's own locked dev
           dependencies, never an overlay, so CI and `make typecheck` run the
           same version with the same config
+        type: string
+        default: ""
+      lint:
+        description: >-
+          Run `ruff check` and `ruff format --check` under `uv run` after the
+          suite, from working-directory. Ruff comes from the project's own
+          locked dev dependencies, like `typecheck`'s checker, so CI and the
+          repo's `make lint` run the same version with the same config
+        type: boolean
+        default: false
+      coverage-min:
+        description: >-
+          Minimum total coverage of the `coverage` package, e.g. "90". Empty
+          gates nothing. Needs `coverage`. Checked after a passing suite, on
+          every event, so main is held to it as well as pull requests
         type: string
         default: ""
       diff-coverage:
@@ -122,19 +138,24 @@ jobs:
       # First, so a misconfigured caller hears in seconds rather than after
       # the toolchain install and a Postgres start.
       - name: Check inputs
-        if: ${{ inputs.diff-coverage != '' }}
+        if: ${{ inputs.diff-coverage != '' || inputs.coverage-min != '' }}
         env:
           COVERAGE: ${{ inputs.coverage }}
           DIFF_COVERAGE: ${{ inputs.diff-coverage }}
+          COVERAGE_MIN: ${{ inputs.coverage-min }}
         run: |
-          if [ -z "$COVERAGE" ]; then
-            echo "::error::diff-coverage needs coverage set to the import package to measure."
-            exit 1
-          fi
-          if ! [[ "$DIFF_COVERAGE" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-            echo "::error::diff-coverage must be a plain number such as 80, not '$DIFF_COVERAGE'."
-            exit 1
-          fi
+          for name in diff-coverage coverage-min; do
+            if [ "$name" = diff-coverage ]; then value="$DIFF_COVERAGE"; else value="$COVERAGE_MIN"; fi
+            [ -n "$value" ] || continue
+            if [ -z "$COVERAGE" ]; then
+              echo "::error::$name needs coverage set to the import package to measure."
+              exit 1
+            fi
+            if ! [[ "$value" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+              echo "::error::$name must be a plain number such as 90, not '$value'."
+              exit 1
+            fi
+          done
 
       # Depth 2 on a pull request: the checkout is the merge commit, and its
       # first parent is the base branch as merged against, which is what
@@ -328,6 +349,36 @@ jobs:
           read -ra command <<< "$TYPECHECK"
           uv run "${args[@]}" "${command[@]}"
 
+      # Same `if` as Type check, so one push reports every finding. Both ruff
+      # commands run before the step fails, for the same reason.
+      - name: Lint
+        if: ${{ !cancelled() && inputs.lint && (steps.suite.outcome == 'success' || steps.suite.outcome == 'failure') }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          EXTRAS: ${{ inputs.extras }}
+          LOCKED: ${{ inputs.locked }}
+        run: |
+          args=()
+          if [ "$LOCKED" = "true" ]; then
+            args+=(--locked)
+          fi
+          for extra in $EXTRAS; do
+            args+=(--extra "$extra")
+          done
+          # Asked of the project's environment, not PATH: `uv run ruff` would
+          # fall back to any ruff the runner has, at whatever version.
+          if ! uv run "${args[@]}" python -c 'import importlib.metadata as m; print("ruff", m.version("ruff"))'; then
+            echo "::error::lint: true, but the project's environment has no ruff. Add it to the extra named in extras."
+            exit 1
+          fi
+          status=0
+          uv run "${args[@]}" ruff check --output-format=github . || status=1
+          if ! uv run "${args[@]}" ruff format --check --diff .; then
+            echo "::error::ruff format would change the files above. Run \`ruff format .\` (or \`make lint\`) and commit the result."
+            status=1
+          fi
+          exit "$status"
+
       # always(), because a failing suite is exactly when the reader wants to
       # know what the tests did reach. Guarded on the data file because a run
       # that died during collection never wrote one, and `coverage report`
@@ -349,10 +400,49 @@ jobs:
             cat coverage.md
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # Gates on the pull request's own lines only. A floor on total coverage
-      # fails a new change for old code it never touched, and is cheapest to
-      # meet by mocking whatever is uncovered; on the diff, the cheapest way is
-      # usually to test the code just written. Only after a passing suite: a
+      # A floor on the total, checked on every event after a passing suite, so
+      # main is held to it as well as pull requests. coverage's own
+      # --fail-under does the arithmetic, the same rounding the report shows.
+      - name: Coverage floor
+        if: ${{ !cancelled() && steps.suite.outcome == 'success' && inputs.coverage-min != '' }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          EXTRAS: ${{ inputs.extras }}
+          LOCKED: ${{ inputs.locked }}
+          COVERAGE_MIN: ${{ inputs.coverage-min }}
+        run: |
+          if [ ! -f .coverage ]; then
+            echo "::error::No .coverage data file in ${PWD}; the floor has nothing to check."
+            exit 1
+          fi
+          args=(--with pytest-cov)
+          if [ "$LOCKED" = "true" ]; then
+            args+=(--locked)
+          fi
+          for extra in $EXTRAS; do
+            args+=(--extra "$extra")
+          done
+          # --format=total prints the rounded total and, with --fail-under,
+          # exits 2 for a total under the floor. Any other failure is reported
+          # as itself, never as a coverage result.
+          status=0
+          total="$(uv run "${args[@]}" coverage report --format=total --fail-under="$COVERAGE_MIN")" || status=$?
+          # Under the floor, coverage adds its own "Coverage failure" line.
+          total="${total%%$'\n'*}"
+          if [ "$status" -eq 2 ]; then
+            echo "::error::Total coverage is ${total}%, under the ${COVERAGE_MIN}% floor."
+            exit 1
+          elif [ "$status" -ne 0 ]; then
+            echo "::error::coverage report failed (exit $status) before it could check the floor. Its log above has the cause."
+            exit 1
+          fi
+          echo "Total coverage ${total}% meets the ${COVERAGE_MIN}% floor."
+
+      # Gates on the pull request's own lines, the complement of the total
+      # floor above: the floor stops a package slipping, and this holds each
+      # change to its own tests even where the total has room to spare. On the
+      # diff, the cheapest way to pass is usually to test the code just
+      # written. Only after a passing suite: a
       # failed test leaves coverage that measures nothing.
       #
       # Compared with HEAD^1, the merge commit's base-branch parent (checked

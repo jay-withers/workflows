@@ -4,10 +4,10 @@ name: Go
 #
 # The Go counterpart of python.yml, and shaped like it on purpose so a Go repo
 # carries the same required check (`<caller job> / Test`, so `test / Test`)
-# and the same gates. Linting stays out of it, as ruff stays out of
-# python.yml: gofmt and golangci-lint belong in the repo's pre-commit hooks,
-# where `make lint` runs them too, and pre-commit.yml reports them. This
-# workflow proves the code works, not that it is tidy.
+# and the same gates. It formats and lints as well as testing (`format`:
+# gofmt; `lint`: golangci-lint, pinned in the caller's mise.toml like Go), so
+# a Go repo's `test / Test` alone says the code is tidy and works. A repo can
+# still run the same tools from pre-commit for fast local feedback.
 #
 # Go comes from the caller's mise.toml and nowhere else. A setup-go fallback
 # would mean two places pin the version and they would drift; mise is already
@@ -18,8 +18,9 @@ name: Go
 #
 # Every gate runs inside the one job, so turning one on adds no new required
 # check: `vet` (go vet, the type checker's counterpart of mypy for what the
-# compiler allows but is almost always a bug), `tidy` (go.mod and go.sum agree
-# with the code, the counterpart of `uv --locked`) and `diff-coverage` (a floor
+# compiler allows but is almost always a bug), `format` and `lint`, `tidy`
+# (go.mod and go.sum agree with the code, the counterpart of `uv --locked`),
+# `coverage-min` (a floor on the module's total) and `diff-coverage` (a floor
 # on how much of the code a pull request changes is run by a test).
 on:
   workflow_call:
@@ -40,6 +41,18 @@ on:
         description: Run go vet over `packages` after the suite
         type: boolean
         default: true
+      format:
+        description: Fail if gofmt would change any .go file tracked under working-directory (vendor/ excepted)
+        type: boolean
+        default: true
+      lint:
+        description: >-
+          Run golangci-lint over `packages`, with the module's own
+          .golangci.yml if it has one. golangci-lint comes from the caller's
+          mise config, like Go, so CI and `make lint` run the same version;
+          the job fails naming the fix when it is not pinned
+        type: boolean
+        default: true
       tidy:
         description: >-
           Fail if `go mod tidy` would change go.mod or go.sum, rather than
@@ -51,8 +64,8 @@ on:
         description: >-
           Measure coverage of `packages` (across packages, through -coverpkg,
           so a test in one package counts for the code it runs in another).
-          Reported into the job summary and never gated: `diff-coverage`
-          gates the pull request's own lines
+          Reported into the job summary, and gated only by `coverage-min`
+          (the total) and `diff-coverage` (the pull request's own lines)
         type: boolean
         default: false
       coverage-pr-comment:
@@ -65,9 +78,16 @@ on:
       diff-coverage:
         description: >-
           Minimum percentage of the lines a pull request changes in `packages`
-          that the suite must run, e.g. "80". Empty gates nothing. Needs
+          that the suite must run, e.g. "90". Empty gates nothing. Needs
           `coverage`. Only the pull request's own lines count, and a pull
           request that changes no measured code passes
+        type: string
+        default: ""
+      coverage-min:
+        description: >-
+          Minimum total statement coverage of `packages`, e.g. "90". Empty
+          gates nothing. Needs `coverage`. Checked after a passing suite, on
+          every event, so main is held to it as well as pull requests
         type: string
         default: ""
       runs-on:
@@ -90,20 +110,23 @@ jobs:
           COVERAGE: ${{ inputs.coverage }}
           COMMENT: ${{ inputs.coverage-pr-comment }}
           DIFF_COVERAGE: ${{ inputs.diff-coverage }}
+          COVERAGE_MIN: ${{ inputs.coverage-min }}
         run: |
+          for name in diff-coverage coverage-min; do
+            if [ "$name" = diff-coverage ]; then value="$DIFF_COVERAGE"; else value="$COVERAGE_MIN"; fi
+            [ -n "$value" ] || continue
+            if [ "$COVERAGE" != "true" ]; then
+              echo "::error::$name needs coverage: true."
+              exit 1
+            fi
+            if ! [[ "$value" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+              echo "::error::$name must be a plain number such as 90, not '$value'."
+              exit 1
+            fi
+          done
           if [ "$COMMENT" = "true" ] && [ "$COVERAGE" != "true" ]; then
             echo "::error::coverage-pr-comment needs coverage: true."
             exit 1
-          fi
-          if [ -n "$DIFF_COVERAGE" ]; then
-            if [ "$COVERAGE" != "true" ]; then
-              echo "::error::diff-coverage needs coverage: true."
-              exit 1
-            fi
-            if ! [[ "$DIFF_COVERAGE" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-              echo "::error::diff-coverage must be a plain number such as 80, not '$DIFF_COVERAGE'."
-              exit 1
-            fi
           fi
 
       # Depth 2 on a pull request: the merge commit's first parent is the base
@@ -129,6 +152,8 @@ jobs:
         # runner) with a Go of its own would otherwise pass this check and run
         # the suite on a version nothing pinned. mise's Go then goes first on
         # PATH, so it is the one every later step runs.
+        env:
+          LINT: ${{ inputs.lint }}
         run: |
           if ! go="$(mise which go 2>/dev/null)"; then
             echo "::error::No mise config from ${PWD#"$GITHUB_WORKSPACE"/} up to the repository root pins go. Add it, e.g. \`mise use go@<version>\`."
@@ -144,10 +169,24 @@ jobs:
           # an error naming both versions instead.
           echo "GOTOOLCHAIN=local" >> "$GITHUB_ENV"
           GOTOOLCHAIN=local go version
+          if [ "$LINT" = "true" ]; then
+            if ! lint="$(mise which golangci-lint 2>/dev/null)"; then
+              echo "::error::lint is on, and no mise config from ${PWD#"$GITHUB_WORKSPACE"/} up to the repository root pins golangci-lint. Add it (\`mise use golangci-lint@<version>\`), or set lint: false."
+              exit 1
+            fi
+            # First on PATH too, ahead of any golangci-lint the image has.
+            dirname "$lint" >> "$GITHUB_PATH"
+            "$lint" version
+          fi
+          # Set rather than guessed: golangci-lint otherwise follows
+          # XDG_CACHE_HOME, and the cache step must save where it writes.
+          lintcache="$HOME/.cache/golangci-lint"
+          echo "GOLANGCI_LINT_CACHE=$lintcache" >> "$GITHUB_ENV"
           {
             echo "version=$(go env GOVERSION)"
             echo "modcache=$(go env GOMODCACHE)"
             echo "buildcache=$(go env GOCACHE)"
+            echo "lintcache=$lintcache"
           } >> "$GITHUB_OUTPUT"
 
       # Keyed on the Go version and go.sum, plus the run id: actions/cache
@@ -163,6 +202,7 @@ jobs:
           path: |
             ${{ steps.go.outputs.modcache }}
             ${{ steps.go.outputs.buildcache }}
+            ${{ steps.go.outputs.lintcache }}
           key: go-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.version }}-${{ hashFiles(format('{0}/go.sum', inputs.working-directory)) }}-${{ hashFiles(format('{0}/go.mod', inputs.working-directory)) }}-${{ github.run_id }}
           restore-keys: |
             go-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.version }}-${{ hashFiles(format('{0}/go.sum', inputs.working-directory)) }}-${{ hashFiles(format('{0}/go.mod', inputs.working-directory)) }}-
@@ -215,6 +255,35 @@ jobs:
           read -ra packages <<< "$PACKAGES"
           go vet "${packages[@]}"
 
+      # gofmt over the tracked files, not the directory: a generated or
+      # ignored file the repo never commits is not the author's to format.
+      # Same `if` as Vet, so one push reports every finding.
+      - name: Format
+        if: ${{ !cancelled() && inputs.format && (steps.suite.outcome == 'success' || steps.suite.outcome == 'failure') }}
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          mapfile -t files < <(git ls-files -- '*.go' ':!:vendor/**' ':!:**/vendor/**')
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No tracked .go files."
+            exit 0
+          fi
+          unformatted="$(gofmt -l "${files[@]}")"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt would change the files below. Run \`gofmt -w\` on them (or \`make lint\`) and commit the result."
+            echo "$unformatted"
+            gofmt -d "${files[@]}"
+            exit 1
+          fi
+
+      - name: Lint
+        if: ${{ !cancelled() && inputs.lint && (steps.suite.outcome == 'success' || steps.suite.outcome == 'failure') }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PACKAGES: ${{ inputs.packages }}
+        run: |
+          read -ra packages <<< "$PACKAGES"
+          golangci-lint run "${packages[@]}"
+
       # Whenever the suite ran, pass or fail, because a failing suite is
       # exactly when the reader wants to know what the tests reached. Not
       # after a setup failure, whose cause it would only bury. Guarded on the
@@ -241,6 +310,26 @@ jobs:
             echo "</details>"
           } > coverage.md
           { echo "## Coverage"; echo; cat coverage.md; } >> "$GITHUB_STEP_SUMMARY"
+
+      # A floor on the total, checked on every event after a passing suite, so
+      # main is held to it as well as pull requests. A failing suite already
+      # fails the job, and its coverage measures nothing.
+      - name: Coverage floor
+        if: ${{ !cancelled() && steps.suite.outcome == 'success' && inputs.coverage-min != '' }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          COVERAGE_MIN: ${{ inputs.coverage-min }}
+        run: |
+          total="$(go tool cover -func=coverage.out | awk '/^total:/ {sub(/%$/, "", $NF); print $NF}')"
+          if [ -z "$total" ]; then
+            echo "::error::Could not read a total from coverage.out."
+            exit 1
+          fi
+          if awk -v t="$total" -v m="$COVERAGE_MIN" 'BEGIN { exit !(t + 0 < m + 0) }'; then
+            echo "::error::Total coverage is ${total}%, under the ${COVERAGE_MIN}% floor."
+            exit 1
+          fi
+          echo "Total coverage ${total}% meets the ${COVERAGE_MIN}% floor."
 
       # diff-cover reads Cobertura XML; gocover-cobertura converts Go's
       # profile into it, with file paths relative to the module directory and
