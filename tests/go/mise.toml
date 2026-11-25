@@ -1,5 +1,6 @@
-# The Go that _self_ci.yml's go.yml self-test runs on. go.yml takes Go from
-# mise.toml and nowhere else, so this module pins its own; mise merges it with
-# the repository root's tools.
+# The Go and golangci-lint that _self_ci.yml's go.yml self-test runs. go.yml
+# takes both from mise.toml and nowhere else, so this module pins its own;
+# mise merges it with the repository root's tools.
 [tools]
 go = "1.27.4"
+golangci-lint = "2.15.0"

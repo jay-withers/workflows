@@ -26,4 +26,5 @@ jobs:
     with:
       working-directory: tests/go
       coverage: true
-      diff-coverage: "80"
+      coverage-min: "90"
+      diff-coverage: "90"

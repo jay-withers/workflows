@@ -10,7 +10,7 @@ Reusable GitHub Actions workflows, called from other repositories via `workflow_
 | [`container-apps-deploy.yml`](.github/workflows/container-apps-deploy.yml) | App CD: OIDC to Azure, then the caller's own `make deploy IMAGE_TAG=<version>` rolls a published image onto its Container Apps workloads |
 | [`pre-commit.yml`](.github/workflows/pre-commit.yml) | Runs all pre-commit hooks against the full repository |
 | [`python.yml`](.github/workflows/python.yml) | Python CI: runs a project's test suite with uv |
-| [`go.yml`](.github/workflows/go.yml) | Go CI: runs a module's test suite, with `go vet`, a tidy check and optional diff coverage |
+| [`go.yml`](.github/workflows/go.yml) | Go CI: runs a module's test suite, with gofmt, golangci-lint, `go vet`, a tidy check and optional coverage floors |
 | [`docker.yml`](.github/workflows/docker.yml) | Container images: builds one or more images, optionally pushing them under immutable tags |
 | [`release.yml`](.github/workflows/release.yml) | Semver tagging on CD: bumps from conventional commits, pushes the tag, creates a GitHub release |
 | [`codeql.yml`](.github/workflows/codeql.yml) | Code scanning: CodeQL static analysis, one job per language, results in the Security tab |
@@ -26,7 +26,7 @@ What each workflow then needs from `mise.toml`, failing with an error naming the
 | `terraform.yml`, `terraform-deploy.yml`, `terraform-unlock.yml`, `container-apps-deploy.yml` (v1.26.1+) | `terraform` (replaces `.terraform-version`) | none |
 | `pre-commit.yml` | `pre-commit`, plus whatever your hooks call: with `terraform: true`, `terraform`, `tflint`, `terraform-docs` and `checkov` | `python-version`, `node-version`, `terraform-version`, `terraform-docs-version`, `checkov-version` |
 | `python.yml` | `uv`, and `python` to choose the interpreter (exported as `UV_PYTHON`; without it uv picks one itself) | `python-version` |
-| `go.yml` (v1.33.0+) | `go`, in any mise config from `working-directory` up to the root. There is no fallback: without one the job fails | none |
+| `go.yml` (v1.33.0+) | `go`, plus `golangci-lint` while `lint` is on (v1.34.0+), in any mise config from `working-directory` up to the root. There is no fallback: without one the job fails | none |
 
 `terraform.yml`'s change filter counts `mise.toml` as a Terraform change (v1.26.1+), so a Terraform bump there is validated. `tflint --init` still runs with `terraform: true`, authenticated with the job's token (v1.31.1+), so a hosted runner's shared anonymous GitHub API limit can't fail it. A repo without `mise.toml` sees no change. Renovate's shared `mise` preset keeps the versions current.
 
@@ -395,7 +395,9 @@ jobs:
       extras: dev
       coverage: investagent
       coverage-pr-comment: true
-      diff-coverage: "80"
+      coverage-min: "90"
+      diff-coverage: "90"
+      lint: true
       typecheck: mypy
       postgres: "18-alpine"
 ```
@@ -407,8 +409,10 @@ Notes:
 - **Pin `python-version` to the version the project actually ships on**, not the newest release. A suite that passes on 3.13 says nothing about an image built `FROM python:3.14`.
 - `locked` defaults to true, so a `pyproject.toml` edited without its lockfile fails here rather than being resolved around silently as it would be on a developer's machine.
 - No internal path filter, unlike `terraform.yml`. A Python suite is seconds of runner time where a Terraform matrix is minutes, so filtering buys little — and always running sidesteps the pending-check trap that file documents.
-- **`coverage` names the import package.** Set it and the table lands in the job summary; add `coverage-pr-comment: true` for a single PR comment kept up to date across pushes. Total coverage is never gated: a total floor fails a new change for old code it never touched, and the cheapest way to meet one is almost always to mock out whatever is uncovered rather than to test it.
+- **`coverage` names the import package.** Set it and the table lands in the job summary; add `coverage-pr-comment: true` for a single PR comment kept up to date across pushes.
+- **`coverage-min` is a floor on the total (v1.34.0+).** The job fails when the `coverage` package's total is under it, by `coverage report --fail-under`, so the rounding matches the table. It is checked after a passing suite on every event, so `main` is held to it as well as pull requests. A total floor can fail a change for old code it never touched, so set it at or below every repo's current total before turning it on, and review the tests a PR adds to clear it: a test that only asserts a mock still counts.
 - **`diff-coverage` gates the pull request's own lines (v1.28.0+).** Set it to a percentage and the job fails when less than that share of the lines the PR changes in the `coverage` package are run by the suite. The threshold is the caller's choice, nothing is gated by default, a PR that changes no measured code passes, and the uncovered lines are listed in the summary and the coverage comment. On the diff, the cheapest way to pass is usually to test the code just written, but a mock that only asserts itself still counts as covered, so review the tests, not just the number. It needs `coverage`, and runs only on `pull_request` after a passing suite.
+- **`lint: true` runs ruff after the suite (v1.34.0+)**: `ruff check` (findings annotated on the PR) and `ruff format --check`, from `working-directory`, under `uv run` with the same `extras` and `locked`. Ruff comes from the project's locked dev dependencies, so it is the version and config the repo's `make lint` uses; the job fails naming the fix when the environment has none. Both commands run before the step fails, and it runs even when a test failed, so one push reports everything. It defaults to off so existing callers see no change; ruff in pre-commit keeps working alongside it.
 - **`typecheck` runs a type checker after the suite (v1.28.0+)**, under `uv run` with the same `extras` and `locked`, so it uses the version the project pins and its config, the same as the repo's `make typecheck`. It runs even when a test failed, so one push reports both.
 - **`postgres` runs a real database for integration tests.** Set it to an image tag and the server is up at `localhost:5432` before the suite runs, with its DSN in `POSTGRES_TEST_DSN`. Tests that need it should *skip* when that variable is absent, so the suite still runs on a clone with no Docker — the workflow deliberately does not provide a fallback DSN, because a test silently pointing at the wrong database is worse than a skipped one. It is started with `docker run` rather than a `services:` block, which cannot be made conditional: a service with an empty image is a workflow error, so a `services:` block would impose Postgres on every caller.
 - **`playwright: true` runs browser tests inside `test / Test`.** Playwright comes from the project's locked dependencies (`pytest-playwright` in the dev extra), so its version is the project's, and the browser download is cached by that version. Only Chromium is installed. Write the browser tests to skip when Chromium is missing on a developer's machine but fail when `CI` is set, or a broken install would pass as skipped. jay-withers/appkit's `appkit.testing.require_browser` does exactly that.
@@ -424,9 +428,11 @@ Notes:
 | `python-version` | `3.12` | Python version to run the suite on |
 | `extras` | `""` | Space-separated optional-dependency extras to install |
 | `command` | `pytest` | Command to run under `uv run` |
-| `coverage` | `""` | Import package to measure coverage of. Empty disables it. Total is never gated |
+| `coverage` | `""` | Import package to measure coverage of. Empty disables it |
+| `coverage-min` | `""` | (v1.34.0+) Minimum total % of `coverage` the suite must run. Empty gates nothing. Needs `coverage` |
 | `diff-coverage` | `""` | Minimum % of the PR's changed lines in `coverage` the suite must run. Empty gates nothing. Needs `coverage` |
 | `typecheck` | `""` | Type-check command to run under `uv run` after the suite, e.g. `mypy`. Empty skips it |
+| `lint` | `false` | (v1.34.0+) Run `ruff check` and `ruff format --check` under `uv run` after the suite |
 | `coverage-pr-comment` | `false` | Post the coverage table as one self-updating PR comment. Needs `pull-requests: write` on the caller |
 | `postgres` | `""` | Postgres image tag to run for the suite. Empty runs none. Exports `POSTGRES_TEST_DSN` |
 | `playwright` | `false` | (v1.29.0+) Install Playwright's Chromium, cached per version, with its system libraries before the suite |
@@ -435,7 +441,7 @@ Notes:
 
 ## Go CI
 
-(v1.33.0+) Runs a Go module's test suite on the Go its `mise.toml` pins: `go mod verify`, a tidy check, `go test` with the race detector, then `go vet`. Shaped like [Python CI](#python-ci) on purpose, so a Go repo carries the same required check and the same gates.
+(v1.33.0+) Runs a Go module's test suite on the Go its `mise.toml` pins: `go mod verify`, a tidy check, `go test` with the race detector, then `go vet`, gofmt and golangci-lint (v1.34.0+). Shaped like [Python CI](#python-ci) on purpose, so a Go repo carries the same required check and the same gates.
 
 ```yaml
 name: ci-go
@@ -454,7 +460,8 @@ jobs:
     with:
       coverage: true
       coverage-pr-comment: true
-      diff-coverage: "80"
+      coverage-min: "90"
+      diff-coverage: "90"
 ```
 
 Notes:
@@ -462,10 +469,11 @@ Notes:
 - **The required status check is `<caller job id> / Test`**, the same as `python.yml`'s, so a repo moving from Python to Go keeps `test / Test` and its branch protection needs no change.
 - **Go comes from `mise.toml` and nowhere else.** There is no `go-version` input and no `setup-go` fallback, so the version is pinned in one place, the same file a developer's machine reads. mise runs from `working-directory`, so it reads every config from there up to the root, and the job fails naming the fix when none pins `go`. mise's Go goes first on `PATH`, ahead of any Go the runner image has. With a `mise.lock` beside the config, mise installs with `--locked`.
 - **`GOTOOLCHAIN=local` for the whole job.** Go's default (`auto`) quietly downloads and runs a newer toolchain when `go.mod`'s `go` or `toolchain` line asks for one, which would make the mise pin decorative. With `local`, a `go.mod` that needs a newer Go than `mise.toml` pins fails with both versions named. Bump the two together.
-- **Linting is not in here**, just as ruff is not in `python.yml`. Run `gofmt` and `golangci-lint` as pre-commit hooks, so `make lint` and `pre-commit / Pre-commit` report them.
+- **`format` and `lint` are on by default (v1.34.0+)**, so `test / Test` alone says the code is formatted, lint-clean and working. `format` fails when `gofmt` would change a tracked `.go` file (`vendor/` excepted) and prints the diff. `lint` runs `golangci-lint run` over `packages`, with the module's `.golangci.yml` if it has one. golangci-lint comes from the mise config, like Go, so add it there (`mise use golangci-lint@<version>`) or set `lint: false`. Both run after the suite, pass or fail, as `vet` does, so one push reports every finding. A repo can still run the same tools from pre-commit for fast local feedback. **Pin a golangci-lint built with a Go at least as new as `go.mod`'s `go` line**, or it refuses to analyse the module; bump the two together (golangci-lint 2.15.0 handles Go 1.27).
 - **`tidy` (default on) fails when `go mod tidy` would change `go.mod` or `go.sum`**, the counterpart of `python.yml`'s `locked`. It uses `go mod tidy -diff`, so it needs Go 1.23+. `go mod verify` always runs, checking every downloaded module against `go.sum`.
 - **`race` (default on) needs cgo**, which the runner has. The shipped binary can still be built with `CGO_ENABLED=0`.
-- **`coverage: true` measures across packages** (`-coverpkg` set to `packages`), so a test in one package counts for the code it runs in another. The total and a per-function listing land in the job summary, and `coverage-pr-comment: true` (which needs `coverage: true`, or the job fails at its first step) posts them as one PR comment kept up to date across pushes. The total is never gated, for the reason given under Python CI.
+- **`coverage: true` measures across packages** (`-coverpkg` set to `packages`), so a test in one package counts for the code it runs in another. The total and a per-function listing land in the job summary, and `coverage-pr-comment: true` (which needs `coverage: true`, or the job fails at its first step) posts them as one PR comment kept up to date across pushes. The total is gated only when `coverage-min` is set.
+- **`coverage-min` is a floor on the total (v1.34.0+)**: the job fails when `go tool cover`'s total statement coverage is under it. It needs `coverage: true` and is checked after a passing suite on every event, so `main` is held to it as well as pull requests.
 - **`diff-coverage` gates the pull request's own lines**, exactly as in `python.yml`. The profile is converted to Cobertura with `gocover-cobertura` and checked by the same pinned `diff-cover`, against `HEAD^1`, on `pull_request` after a passing suite. It needs `coverage: true`. Both tool pins are kept current by regex managers in [`renovate.json`](renovate.json).
 - **`vet` runs `go vet` after the suite**, even when a test failed, so one push reports both.
 - **Permissions:** `contents: read`, plus `pull-requests: write` for the comment. Without it the comment logs a warning and the suite still passes. The workflow declares no permissions of its own, so set them on the caller.
@@ -478,8 +486,11 @@ Notes:
 | `packages` | `./...` | Space-separated package patterns to test, vet and measure |
 | `race` | `true` | Run the suite with `-race` |
 | `vet` | `true` | Run `go vet` over `packages` after the suite |
+| `format` | `true` | (v1.34.0+) Fail if `gofmt` would change a tracked `.go` file |
+| `lint` | `true` | (v1.34.0+) Run `golangci-lint run` over `packages`. Needs `golangci-lint` in the mise config |
 | `tidy` | `true` | Fail if `go mod tidy` would change `go.mod` or `go.sum` (Go 1.23+) |
-| `coverage` | `false` | Measure coverage of `packages`. Reported, never gated |
+| `coverage` | `false` | Measure coverage of `packages`. Reported; gated only by the two inputs below |
+| `coverage-min` | `""` | (v1.34.0+) Minimum total statement coverage. Empty gates nothing. Needs `coverage` |
 | `diff-coverage` | `""` | Minimum % of the PR's changed lines the suite must run. Empty gates nothing. Needs `coverage` |
 | `coverage-pr-comment` | `false` | Post the coverage report as one self-updating PR comment. Needs `coverage` and `pull-requests: write` on the caller |
 | `runs-on` | `ubuntu-latest` | Runner label |
@@ -685,7 +696,7 @@ Notes:
 
 This repo dogfoods its own reusable workflows by calling them with local paths (no `@ref` needed). These callers are prefixed `_self_` to distinguish them from the public reusable workflows — they are internal and not meant to be consumed by other repos:
 
-- [`_self_ci.yml`](.github/workflows/_self_ci.yml) calls [`pre-commit.yml`](.github/workflows/pre-commit.yml) on every push and pull request — the hooks in [`.pre-commit-config.yaml`](.pre-commit-config.yaml) cover actionlint, gitleaks secret scanning and file hygiene. It also calls [`go.yml`](.github/workflows/go.yml) against the sample module in [`tests/go`](tests/go) with every gate but the PR comment on, so a change to `go.yml` runs before any caller's pin moves. That job is not a required check. The diff-coverage gate only meets real lines on a PR that changes `tests/go/calc`, so touch it when changing how coverage is converted.
+- [`_self_ci.yml`](.github/workflows/_self_ci.yml) calls [`pre-commit.yml`](.github/workflows/pre-commit.yml) on every push and pull request — the hooks in [`.pre-commit-config.yaml`](.pre-commit-config.yaml) cover actionlint, gitleaks secret scanning and file hygiene. It also calls [`go.yml`](.github/workflows/go.yml) against the sample module in [`tests/go`](tests/go) with every gate but the PR comment on (format, lint, and both coverage floors at 90%), so a change to `go.yml` runs before any caller's pin moves. That job is not a required check. The diff-coverage gate only meets real lines on a PR that changes `tests/go/calc`, so touch it when changing how coverage is converted.
 - [`_self_codeql.yml`](.github/workflows/_self_codeql.yml) calls [`codeql.yml`](.github/workflows/codeql.yml) with `languages: '["actions"]'`, scanning this repo's own workflow files, which are the only code here.
 - [`_self_cd.yml`](.github/workflows/_self_cd.yml) calls [`release.yml`](.github/workflows/release.yml) on pushes to `main` with `update-major-tag: true`, so callers can pin to `@v1`.
 - Every external action is pinned to a full commit SHA with the version in a trailing comment. A pre-commit hook (`pin-github-actions`) enforces this in CI, and Renovate keeps the pins up to date.
