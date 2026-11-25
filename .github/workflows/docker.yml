@@ -24,6 +24,10 @@ on:
           `[{"name": "api", "context": "apps/api"}]`. `name` is the last
           segment of the image reference and the cache scope; `context` is the
           build context relative to the repository root. One matrix leg each.
+          (v1.35.0+) An optional `python`, the command that runs the image's
+          interpreter (`"python"`, `"python3"`), checks on a build that does
+          not push that its major.minor matches the `python` pin in the
+          repository root's mise.toml, which local runs and CI test on.
         required: true
         type: string
       ref:
@@ -251,7 +255,8 @@ jobs:
           # A pull request build is loaded into the local daemon under a
           # local-only tag so Trivy can scan it; a pushed build is scanned
           # from the registry instead. Loading needs a single platform.
-          load: ${{ !inputs.push && inputs.scan && !contains(inputs.platforms, ',') }}
+          # The Python check (below) runs the loaded image too.
+          load: ${{ !inputs.push && (inputs.scan || matrix.image.python != '') && !contains(inputs.platforms, ',') }}
           # The local tag only on a build that does not push: pushed, it would
           # go to Docker Hub.
           tags: |
@@ -387,6 +392,68 @@ jobs:
           push-to-registry: true
 
       # Last, so the findings are uploaded before the job fails on them.
+      # The image's own interpreter against the one mise.toml pins, which is
+      # what local test runs and python.yml's suite run on. They are pinned in
+      # two places (the image's base, often another repository's, and
+      # mise.toml) and nothing else compares them, so a pass in CI could
+      # otherwise say nothing about the interpreter that ships. Major.minor
+      # only: a patch release changes no behaviour a suite would see. On a
+      # build that does not push, which is every pull request and the daily
+      # build of main, so drift on either side fails a PR or opens the
+      # build-failed issue. After the scan and its upload, so a mismatch
+      # never hides the image's findings.
+      - name: Check ${{ matrix.image.name }}'s Python matches mise.toml
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && !inputs.push && matrix.image.python != '' && !contains(inputs.platforms, ',') }}
+        env:
+          PYTHON_COMMAND: ${{ matrix.image.python }}
+          LOCAL_REF: local-scan/${{ matrix.image.name }}:${{ github.run_id }}
+          NAME: ${{ matrix.image.name }}
+        run: |
+          config=""
+          for candidate in mise.toml .mise.toml; do
+            if [ -f "$candidate" ]; then config="$candidate"; break; fi
+          done
+          if [ -z "$config" ]; then
+            echo "::error::$NAME sets python, but the repository has no mise.toml at its root to compare with."
+            exit 1
+          fi
+          # tomllib, not a regex: mise takes `python = "3.15.2"`, a list
+          # (`["3.15"]`, the first is the default) or a table with `version`,
+          # and only [tools] counts.
+          pinned="$(python3 - "$config" <<'PY'
+          import re, sys, tomllib
+          tool = tomllib.load(open(sys.argv[1], "rb")).get("tools", {}).get("python")
+          if isinstance(tool, list):
+              tool = tool[0] if tool else None
+          if isinstance(tool, dict):
+              tool = tool.get("version")
+          match = re.match(r"(\d+)\.(\d+)", str(tool or ""))
+          print(f"{match[1]}.{match[2]}" if match else "")
+          PY
+          )"
+          if [ -z "$pinned" ]; then
+            echo "::error::$NAME sets python, but $config pins no python X.Y[.Z] under [tools]."
+            exit 1
+          fi
+          image="$(docker run --rm --entrypoint "$PYTHON_COMMAND" "$LOCAL_REF" \
+            -c 'import sys; print("%d.%d" % sys.version_info[:2])')" || {
+            echo "::error::Could not run '$PYTHON_COMMAND' in $NAME's image. Set python to the command that starts its interpreter."
+            exit 1
+          }
+          if [ "$image" != "$pinned" ]; then
+            echo "::error::$NAME's image runs Python $image, but $config pins $pinned, which local runs and CI test on. Move them together: the base image's Python and $config's python."
+            exit 1
+          fi
+          echo "$NAME's image runs Python $image, as $config pins."
+
+      # Not run on a multi-platform build, which is never loaded into the
+      # daemon; said so rather than skipped silently.
+      - name: Note the skipped Python check
+        if: ${{ !inputs.push && matrix.image.python != '' && contains(inputs.platforms, ',') }}
+        env:
+          NAME: ${{ matrix.image.name }}
+        run: echo "::warning::$NAME sets python, but a multi-platform build is not loaded to run it, so its Python was not compared with mise.toml. Build one platform on pull requests to check it."
+
       - name: Refuse fixable ${{ inputs.scan-fail-on }} vulnerabilities
         if: steps.scan.outputs.gate != '' && steps.scan.outputs.gate != '0'
         env:
@@ -454,14 +521,14 @@ jobs:
           fi
           if [ "$OUTCOME" = "failure" ]; then
             gh label create "$label" -R "$REPOSITORY" --color B60205 \
-              --description "The image no longer builds or passes Trivy on main. Closed by the next success." 2>/dev/null || true
+              --description "The image no longer builds, passes Trivy, or matches mise.toml's Python on main. Closed by the next success." 2>/dev/null || true
             if [ -n "$existing" ]; then
               gh issue comment "$existing" -R "$REPOSITORY" --body "Failed again: $RUN_URL" > /dev/null
             else
               body="$(printf '%s\n%s\n\n%s\n\n%s\n' "$MARKER" \
-                "@$OWNER The image build on \`$REF\` failed: it no longer builds, or Trivy found a fixable CRITICAL/HIGH vulnerability. Every pull request's \`container-build\` check fails the same way until it is fixed, so Renovate's PRs stop merging." \
+                "@$OWNER The image build on \`$REF\` failed: it no longer builds, Trivy found a fixable CRITICAL/HIGH vulnerability, or its Python no longer matches mise.toml's (the log names which). Every pull request's \`container-build\` check fails the same way until it is fixed, so Renovate's PRs stop merging." \
                 "Run: $RUN_URL" \
-                "Fix it on main (bump the base image or package, or accept the risk in \`.trivyignore\`). This issue closes itself on the next successful build.")"
+                "Fix it on main (bump the base image or package, accept the risk in \`.trivyignore\`, or move the base image's Python and mise.toml's python together). This issue closes itself on the next successful build.")"
               gh issue create -R "$REPOSITORY" --title "Image build on $REF failed" --label "$label" --body "$body" > /dev/null
             fi
           elif [ -n "$existing" ]; then
