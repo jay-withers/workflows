@@ -10,6 +10,7 @@ Reusable GitHub Actions workflows, called from other repositories via `workflow_
 | [`container-apps-deploy.yml`](.github/workflows/container-apps-deploy.yml) | App CD: OIDC to Azure, then the caller's own `make deploy IMAGE_TAG=<version>` rolls a published image onto its Container Apps workloads |
 | [`pre-commit.yml`](.github/workflows/pre-commit.yml) | Runs all pre-commit hooks against the full repository |
 | [`python.yml`](.github/workflows/python.yml) | Python CI: runs a project's test suite with uv |
+| [`go.yml`](.github/workflows/go.yml) | Go CI: runs a module's test suite, with `go vet`, a tidy check and optional diff coverage |
 | [`docker.yml`](.github/workflows/docker.yml) | Container images: builds one or more images, optionally pushing them under immutable tags |
 | [`release.yml`](.github/workflows/release.yml) | Semver tagging on CD: bumps from conventional commits, pushes the tag, creates a GitHub release |
 | [`codeql.yml`](.github/workflows/codeql.yml) | Code scanning: CodeQL static analysis, one job per language, results in the Security tab |
@@ -25,6 +26,7 @@ What each workflow then needs from `mise.toml`, failing with an error naming the
 | `terraform.yml`, `terraform-deploy.yml`, `terraform-unlock.yml`, `container-apps-deploy.yml` (v1.26.1+) | `terraform` (replaces `.terraform-version`) | none |
 | `pre-commit.yml` | `pre-commit`, plus whatever your hooks call: with `terraform: true`, `terraform`, `tflint`, `terraform-docs` and `checkov` | `python-version`, `node-version`, `terraform-version`, `terraform-docs-version`, `checkov-version` |
 | `python.yml` | `uv`, and `python` to choose the interpreter (exported as `UV_PYTHON`; without it uv picks one itself) | `python-version` |
+| `go.yml` (v1.33.0+) | `go`, in any mise config from `working-directory` up to the root. There is no fallback: without one the job fails | none |
 
 `terraform.yml`'s change filter counts `mise.toml` as a Terraform change (v1.26.1+), so a Terraform bump there is validated. `tflint --init` still runs with `terraform: true`, authenticated with the job's token (v1.31.1+), so a hosted runner's shared anonymous GitHub API limit can't fail it. A repo without `mise.toml` sees no change. Renovate's shared `mise` preset keeps the versions current.
 
@@ -431,6 +433,57 @@ Notes:
 | `locked` | `true` | Fail if `uv.lock` is out of date with `pyproject.toml` |
 | `runs-on` | `ubuntu-latest` | Runner label |
 
+## Go CI
+
+(v1.33.0+) Runs a Go module's test suite on the Go its `mise.toml` pins: `go mod verify`, a tidy check, `go test` with the race detector, then `go vet`. Shaped like [Python CI](#python-ci) on purpose, so a Go repo carries the same required check and the same gates.
+
+```yaml
+name: ci-go
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write  # only needed for coverage-pr-comment
+
+jobs:
+  test:
+    uses: jay-withers/workflows/.github/workflows/go.yml@main
+    with:
+      coverage: true
+      coverage-pr-comment: true
+      diff-coverage: "80"
+```
+
+Notes:
+
+- **The required status check is `<caller job id> / Test`**, the same as `python.yml`'s, so a repo moving from Python to Go keeps `test / Test` and its branch protection needs no change.
+- **Go comes from `mise.toml` and nowhere else.** There is no `go-version` input and no `setup-go` fallback, so the version is pinned in one place, the same file a developer's machine reads. mise runs from `working-directory`, so it reads every config from there up to the root, and the job fails naming the fix when none pins `go`. mise's Go goes first on `PATH`, ahead of any Go the runner image has. With a `mise.lock` beside the config, mise installs with `--locked`.
+- **`GOTOOLCHAIN=local` for the whole job.** Go's default (`auto`) quietly downloads and runs a newer toolchain when `go.mod`'s `go` or `toolchain` line asks for one, which would make the mise pin decorative. With `local`, a `go.mod` that needs a newer Go than `mise.toml` pins fails with both versions named. Bump the two together.
+- **Linting is not in here**, just as ruff is not in `python.yml`. Run `gofmt` and `golangci-lint` as pre-commit hooks, so `make lint` and `pre-commit / Pre-commit` report them.
+- **`tidy` (default on) fails when `go mod tidy` would change `go.mod` or `go.sum`**, the counterpart of `python.yml`'s `locked`. It uses `go mod tidy -diff`, so it needs Go 1.23+. `go mod verify` always runs, checking every downloaded module against `go.sum`.
+- **`race` (default on) needs cgo**, which the runner has. The shipped binary can still be built with `CGO_ENABLED=0`.
+- **`coverage: true` measures across packages** (`-coverpkg` set to `packages`), so a test in one package counts for the code it runs in another. The total and a per-function listing land in the job summary, and `coverage-pr-comment: true` (which needs `coverage: true`, or the job fails at its first step) posts them as one PR comment kept up to date across pushes. The total is never gated, for the reason given under Python CI.
+- **`diff-coverage` gates the pull request's own lines**, exactly as in `python.yml`. The profile is converted to Cobertura with `gocover-cobertura` and checked by the same pinned `diff-cover`, against `HEAD^1`, on `pull_request` after a passing suite. It needs `coverage: true`. Both tool pins are kept current by regex managers in [`renovate.json`](renovate.json).
+- **`vet` runs `go vet` after the suite**, even when a test failed, so one push reports both.
+- **Permissions:** `contents: read`, plus `pull-requests: write` for the comment. Without it the comment logs a warning and the suite still passes. The workflow declares no permissions of its own, so set them on the caller.
+
+### Go inputs
+
+| Input | Default | Description |
+| --- | --- | --- |
+| `working-directory` | `.` | Directory holding `go.mod` |
+| `packages` | `./...` | Space-separated package patterns to test, vet and measure |
+| `race` | `true` | Run the suite with `-race` |
+| `vet` | `true` | Run `go vet` over `packages` after the suite |
+| `tidy` | `true` | Fail if `go mod tidy` would change `go.mod` or `go.sum` (Go 1.23+) |
+| `coverage` | `false` | Measure coverage of `packages`. Reported, never gated |
+| `diff-coverage` | `""` | Minimum % of the PR's changed lines the suite must run. Empty gates nothing. Needs `coverage` |
+| `coverage-pr-comment` | `false` | Post the coverage report as one self-updating PR comment. Needs `coverage` and `pull-requests: write` on the caller |
+| `runs-on` | `ubuntu-latest` | Runner label |
+
 ## Container images
 
 Builds every image a repository ships, and optionally pushes them. A pull request calls this with `push: false`; the release calls it with `push: true` and the tags to publish. Nothing else differs between the two, which is the point — kept as separate workflows, the PR build and the release build drift on platform, context and cache scope until a green PR proves very little about the release.
@@ -632,7 +685,7 @@ Notes:
 
 This repo dogfoods its own reusable workflows by calling them with local paths (no `@ref` needed). These callers are prefixed `_self_` to distinguish them from the public reusable workflows — they are internal and not meant to be consumed by other repos:
 
-- [`_self_ci.yml`](.github/workflows/_self_ci.yml) calls [`pre-commit.yml`](.github/workflows/pre-commit.yml) on every push and pull request — the hooks in [`.pre-commit-config.yaml`](.pre-commit-config.yaml) cover actionlint, gitleaks secret scanning and file hygiene.
+- [`_self_ci.yml`](.github/workflows/_self_ci.yml) calls [`pre-commit.yml`](.github/workflows/pre-commit.yml) on every push and pull request — the hooks in [`.pre-commit-config.yaml`](.pre-commit-config.yaml) cover actionlint, gitleaks secret scanning and file hygiene. It also calls [`go.yml`](.github/workflows/go.yml) against the sample module in [`tests/go`](tests/go) with every gate but the PR comment on, so a change to `go.yml` runs before any caller's pin moves. That job is not a required check. The diff-coverage gate only meets real lines on a PR that changes `tests/go/calc`, so touch it when changing how coverage is converted.
 - [`_self_codeql.yml`](.github/workflows/_self_codeql.yml) calls [`codeql.yml`](.github/workflows/codeql.yml) with `languages: '["actions"]'`, scanning this repo's own workflow files, which are the only code here.
 - [`_self_cd.yml`](.github/workflows/_self_cd.yml) calls [`release.yml`](.github/workflows/release.yml) on pushes to `main` with `update-major-tag: true`, so callers can pin to `@v1`.
 - Every external action is pinned to a full commit SHA with the version in a trailing comment. A pre-commit hook (`pin-github-actions`) enforces this in CI, and Renovate keeps the pins up to date.

@@ -1,5 +1,5 @@
-# Internal: this repo's own use of the reusable pre-commit.yml workflow.
-# Not part of the public API — other repos should call pre-commit.yml directly.
+# Internal: this repo's own use of the reusable pre-commit.yml and go.yml
+# workflows. Not part of the public API — other repos should call them directly.
 name: CI
 
 on:
@@ -14,3 +14,16 @@ permissions:
 jobs:
   pre-commit:
     uses: ./.github/workflows/pre-commit.yml
+
+  # A self-test of go.yml against the sample module in tests/go, so a change
+  # to go.yml runs before any caller's pin moves. Every gate is on except the
+  # PR comment, which would need pull-requests: write on this repo. The
+  # diff-coverage path mapping only meets real lines on a PR that changes
+  # tests/go/calc; touch it there when changing how coverage is converted.
+  # Not a required check: it only ever proves go.yml works.
+  go:
+    uses: ./.github/workflows/go.yml
+    with:
+      working-directory: tests/go
+      coverage: true
+      diff-coverage: "80"
