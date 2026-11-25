@@ -1,0 +1,305 @@
+name: Go
+
+# Reusable Go CI: run a module's test suite.
+#
+# The Go counterpart of python.yml, and shaped like it on purpose so a Go repo
+# carries the same required check (`<caller job> / Test`, so `test / Test`)
+# and the same gates. Linting stays out of it, as ruff stays out of
+# python.yml: gofmt and golangci-lint belong in the repo's pre-commit hooks,
+# where `make lint` runs them too, and pre-commit.yml reports them. This
+# workflow proves the code works, not that it is tidy.
+#
+# Go comes from the caller's mise.toml and nowhere else. A setup-go fallback
+# would mean two places pin the version and they would drift; mise is already
+# how every repo here pins its tools, locally and in CI.
+#
+# Like python.yml, deliberately no internal path filter: a Go suite is seconds
+# of runner time, and always running means the required check always reports.
+#
+# Every gate runs inside the one job, so turning one on adds no new required
+# check: `vet` (go vet, the type checker's counterpart of mypy for what the
+# compiler allows but is almost always a bug), `tidy` (go.mod and go.sum agree
+# with the code, the counterpart of `uv --locked`) and `diff-coverage` (a floor
+# on how much of the code a pull request changes is run by a test).
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Directory holding go.mod
+        type: string
+        default: "."
+      packages:
+        description: Space-separated package patterns to test, vet and measure
+        type: string
+        default: "./..."
+      race:
+        description: Run the suite with the race detector. It needs cgo, which the runner has; the shipped binary can still be built with CGO_ENABLED=0
+        type: boolean
+        default: true
+      vet:
+        description: Run go vet over `packages` after the suite
+        type: boolean
+        default: true
+      tidy:
+        description: >-
+          Fail if `go mod tidy` would change go.mod or go.sum, rather than
+          letting a module edited without them build from whatever the cache
+          resolves. Needs Go 1.23+ (`go mod tidy -diff`)
+        type: boolean
+        default: true
+      coverage:
+        description: >-
+          Measure coverage of `packages` (across packages, through -coverpkg,
+          so a test in one package counts for the code it runs in another).
+          Reported into the job summary and never gated: `diff-coverage`
+          gates the pull request's own lines
+        type: boolean
+        default: false
+      coverage-pr-comment:
+        description: >-
+          Post the coverage report as a single PR comment, updated in place on
+          every run. Needs `pull-requests: write` on the caller; without it the
+          comment logs a warning and the suite still passes
+        type: boolean
+        default: false
+      diff-coverage:
+        description: >-
+          Minimum percentage of the lines a pull request changes in `packages`
+          that the suite must run, e.g. "80". Empty gates nothing. Needs
+          `coverage`. Only the pull request's own lines count, and a pull
+          request that changes no measured code passes
+        type: string
+        default: ""
+      runs-on:
+        description: Runner label
+        type: string
+        default: ubuntu-latest
+
+jobs:
+  test:
+    # The check name is API: callers' required checks read `<job> / Test`.
+    name: Test
+    runs-on: ${{ inputs.runs-on }}
+    # No `permissions` block, for the same reason as python.yml: a pinned
+    # `contents: read` here would make coverage-pr-comment's
+    # `pull-requests: write` unobtainable whatever the caller grants.
+    steps:
+      # First, so a misconfigured caller hears in seconds.
+      - name: Check inputs
+        env:
+          COVERAGE: ${{ inputs.coverage }}
+          COMMENT: ${{ inputs.coverage-pr-comment }}
+          DIFF_COVERAGE: ${{ inputs.diff-coverage }}
+        run: |
+          if [ "$COMMENT" = "true" ] && [ "$COVERAGE" != "true" ]; then
+            echo "::error::coverage-pr-comment needs coverage: true."
+            exit 1
+          fi
+          if [ -n "$DIFF_COVERAGE" ]; then
+            if [ "$COVERAGE" != "true" ]; then
+              echo "::error::diff-coverage needs coverage: true."
+              exit 1
+            fi
+            if ! [[ "$DIFF_COVERAGE" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+              echo "::error::diff-coverage must be a plain number such as 80, not '$DIFF_COVERAGE'."
+              exit 1
+            fi
+          fi
+
+      # Depth 2 on a pull request: the merge commit's first parent is the base
+      # branch as merged against, which diff-coverage diffs against.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 1 }}
+
+      # Run from the module's directory: mise reads every config from there up
+      # to the repository root (mise.toml, .mise.toml, .config/mise.toml...),
+      # so a module in a subdirectory can pin its Go beside it and still
+      # inherit the root's tools.
+      - name: Setup mise
+        uses: jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a # v5.2.10
+        with:
+          working_directory: ${{ github.workspace }}/${{ inputs.working-directory }}
+
+      - name: Check Go comes from mise
+        id: go
+        working-directory: ${{ inputs.working-directory }}
+        # `mise which`, not `command -v`: a runner image (or a self-hosted
+        # runner) with a Go of its own would otherwise pass this check and run
+        # the suite on a version nothing pinned. mise's Go then goes first on
+        # PATH, so it is the one every later step runs.
+        run: |
+          if ! go="$(mise which go 2>/dev/null)"; then
+            echo "::error::No mise config from ${PWD#"$GITHUB_WORKSPACE"/} up to the repository root pins go. Add it, e.g. \`mise use go@<version>\`."
+            exit 1
+          fi
+          # First on PATH for every later step, ahead of any Go the image has.
+          bindir="$(dirname "$go")"
+          echo "$bindir" >> "$GITHUB_PATH"
+          PATH="$bindir:$PATH"
+          # GOTOOLCHAIN=local: Go's default (auto) quietly downloads and runs a
+          # newer toolchain whenever go.mod's go or toolchain line asks for one,
+          # which would make mise's pin decorative. Local makes that mismatch
+          # an error naming both versions instead.
+          echo "GOTOOLCHAIN=local" >> "$GITHUB_ENV"
+          GOTOOLCHAIN=local go version
+          {
+            echo "version=$(go env GOVERSION)"
+            echo "modcache=$(go env GOMODCACHE)"
+            echo "buildcache=$(go env GOCACHE)"
+          } >> "$GITHUB_OUTPUT"
+
+      # Keyed on the Go version and go.sum, plus the run id: actions/cache
+      # never re-saves a key it hit, so without a per-run suffix the build
+      # cache would freeze at its first save. Restores fall back to the newest
+      # cache for the same Go and go.sum, then for the same Go. Go invalidates
+      # build-cache entries by content, so a stale one costs a rebuild, never a
+      # wrong result. go.mod's hash is in the key, and go.mod names the module,
+      # so two modules in one repo never share one.
+      - name: Cache Go modules and build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ steps.go.outputs.modcache }}
+            ${{ steps.go.outputs.buildcache }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.version }}-${{ hashFiles(format('{0}/go.sum', inputs.working-directory)) }}-${{ hashFiles(format('{0}/go.mod', inputs.working-directory)) }}-${{ github.run_id }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.version }}-${{ hashFiles(format('{0}/go.sum', inputs.working-directory)) }}-${{ hashFiles(format('{0}/go.mod', inputs.working-directory)) }}-
+            go-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.version }}-
+
+      # go mod verify checks the module cache against go.sum, so a tampered
+      # download fails here rather than building.
+      - name: Verify modules
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          TIDY: ${{ inputs.tidy }}
+        run: |
+          go mod download
+          go mod verify
+          if [ "$TIDY" = "true" ] && ! go mod tidy -diff; then
+            echo "::error::go.mod or go.sum is out of date with the code. Run \`go mod tidy\` and commit the result."
+            exit 1
+          fi
+
+      - name: Run go test
+        id: suite
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          # Through the environment rather than interpolated into the script:
+          # an input expanded directly into `run` is executed by the shell.
+          PACKAGES: ${{ inputs.packages }}
+          RACE: ${{ inputs.race }}
+          COVERAGE: ${{ inputs.coverage }}
+        run: |
+          read -ra packages <<< "$PACKAGES"
+          args=()
+          if [ "$RACE" = "true" ]; then
+            args+=(-race)
+          fi
+          if [ "$COVERAGE" = "true" ]; then
+            # -coverpkg takes a comma-separated list of the same patterns.
+            coverpkg="$(IFS=,; echo "${packages[*]}")"
+            args+=(-coverprofile=coverage.out -covermode=atomic -coverpkg="$coverpkg")
+          fi
+          go test "${args[@]}" "${packages[@]}"
+
+      # Runs when the suite ran, pass or fail, so one push reports both a
+      # failing test and a vet finding.
+      - name: Vet
+        if: ${{ !cancelled() && inputs.vet && (steps.suite.outcome == 'success' || steps.suite.outcome == 'failure') }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PACKAGES: ${{ inputs.packages }}
+        run: |
+          read -ra packages <<< "$PACKAGES"
+          go vet "${packages[@]}"
+
+      # Whenever the suite ran, pass or fail, because a failing suite is
+      # exactly when the reader wants to know what the tests reached. Not
+      # after a setup failure, whose cause it would only bury. Guarded on the
+      # profile, which a run that failed to compile never wrote.
+      - name: Report coverage
+        if: ${{ !cancelled() && inputs.coverage && (steps.suite.outcome == 'success' || steps.suite.outcome == 'failure') }}
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          if [ ! -f coverage.out ]; then
+            echo "No coverage profile was written — skipping the report." >&2
+            exit 0
+          fi
+          go tool cover -func=coverage.out > coverage-func.txt
+          total="$(awk '/^total:/ {print $NF}' coverage-func.txt)"
+          {
+            echo "**Total: ${total}** of statements"
+            echo
+            echo "<details><summary>Per function</summary>"
+            echo
+            echo '```text'
+            cat coverage-func.txt
+            echo '```'
+            echo
+            echo "</details>"
+          } > coverage.md
+          { echo "## Coverage"; echo; cat coverage.md; } >> "$GITHUB_STEP_SUMMARY"
+
+      # diff-cover reads Cobertura XML; gocover-cobertura converts Go's
+      # profile into it, with file paths relative to the module directory and
+      # the module directory as the source root, which diff-cover joins to
+      # match the paths in `git diff` from the repository root. Both tools are
+      # pinned, because their arithmetic decides a required check, and
+      # renovate.json's regex managers keep the pins current. diff-cover is the
+      # same tool and version as python.yml's, run the same way.
+      - name: Setup uv
+        if: ${{ !cancelled() && steps.suite.outcome == 'success' && inputs.diff-coverage != '' && github.event_name == 'pull_request' }}
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+
+      # Compared with HEAD^1, the merge commit's base-branch parent. Only after
+      # a passing suite: a failed test leaves coverage that measures nothing.
+      - name: Diff coverage
+        if: ${{ !cancelled() && steps.suite.outcome == 'success' && inputs.diff-coverage != '' && github.event_name == 'pull_request' }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          DIFF_COVERAGE: ${{ inputs.diff-coverage }}
+        run: |
+          go run github.com/boumenot/gocover-cobertura@v1.5.0 < coverage.out > coverage.xml
+          status=0
+          uv tool run diff-cover@11.0.4 coverage.xml \
+            --compare-branch=HEAD^1 --fail-under="$DIFF_COVERAGE" \
+            --format markdown:diff-coverage.md || status=$?
+          if [ ! -f diff-coverage.md ]; then
+            echo "::error::diff-cover failed before writing a report (exit $status). Its log above has the cause; this is not a coverage result."
+            exit 1
+          fi
+          cat diff-coverage.md >> "$GITHUB_STEP_SUMMARY"
+          { echo; cat diff-coverage.md; } >> coverage.md
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Under $DIFF_COVERAGE% of the lines this pull request changes are run by a test. The summary lists them."
+          fi
+          exit "$status"
+
+      # One comment kept up to date, matched on an HTML marker, exactly as
+      # python.yml does. A caller using both workflows in one repo gets one
+      # comment from each, so the markers differ.
+      - name: Comment coverage on the pull request
+        if: ${{ always() && inputs.coverage && inputs['coverage-pr-comment'] && github.event_name == 'pull_request' }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          [ -f coverage.md ] || exit 0
+          marker='<!-- jay-withers/workflows: go coverage -->'
+          printf '%s\n## Coverage\n\n' "$marker" > comment.md
+          cat coverage.md >> comment.md
+          existing=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            --jq "map(select(.body | startswith(\"$marker\")))[0].id // empty")
+          # Never fatal: a read-only token (a fork, or a caller that did not
+          # grant pull-requests: write) must not fail a suite that passed.
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$existing" -F body=@comment.md >/dev/null \
+              || echo "::warning::Could not update the coverage comment (needs pull-requests: write on the caller)."
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -F body=@comment.md >/dev/null \
+              || echo "::warning::Could not post the coverage comment (needs pull-requests: write on the caller)."
+          fi

@@ -29,9 +29,11 @@ is `docs/delivery.md` in `jay-withers/factory`.
   docker.yml                  build, optional push, Trivy, provenance + SBOM attestations
   pre-commit.yml              pre-commit run --all-files (optional Terraform toolchain)
   python.yml                  uv + pytest, optional coverage, diff-coverage gate, type check, Postgres
+  go.yml                      Go from mise.toml + go test -race, go vet, tidy check, optional coverage and diff-coverage gate
   codeql.yml                  CodeQL per language
   release.yml                 semver tag + GitHub release from Conventional Commits
   _self_*.yml                 this repo's own callers (CI, CodeQL, release) - not for other repos
+tests/go/                     the sample module _self_ci.yml runs go.yml against
 scripts/
   smoke.sh                    the post-deploy smoke test every app's `make smoke` fetches at its pinned SHA
 ```
@@ -93,7 +95,8 @@ the way it is. Read it before changing the workflow, and keep it current.
 
 ## Verifying a change
 
-There is no test suite. Before opening a PR:
+There is no test suite, apart from `tests/go`, the sample module that
+`_self_ci.yml` runs `go.yml` against on every PR. Before opening a PR:
 
 - `make pre-commit` runs every hook, including actionlint, shellcheck on the
   inline scripts, and gitleaks. `make lint` runs actionlint alone.

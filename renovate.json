@@ -6,12 +6,25 @@
       "customType": "regex",
       "datasourceTemplate": "pypi",
       "depNameTemplate": "diff-cover",
-      "description": "diff-cover is pinned inside python.yml's Diff coverage script, where no built-in manager looks.",
+      "description": "diff-cover is pinned inside python.yml's and go.yml's Diff coverage scripts, where no built-in manager looks. Both match, so one PR moves them together.",
       "fileMatch": [
-        "^\\.github/workflows/python\\.yml$"
+        "^\\.github/workflows/python\\.yml$",
+        "^\\.github/workflows/go\\.yml$"
       ],
       "matchStrings": [
         "uv tool run diff-cover@(?<currentValue>[0-9][^\\s]*)"
+      ]
+    },
+    {
+      "customType": "regex",
+      "datasourceTemplate": "go",
+      "depNameTemplate": "github.com/boumenot/gocover-cobertura",
+      "description": "gocover-cobertura is pinned inside go.yml's Diff coverage script, where no built-in manager looks.",
+      "fileMatch": [
+        "^\\.github/workflows/go\\.yml$"
+      ],
+      "matchStrings": [
+        "go run github\\.com/boumenot/gocover-cobertura@(?<currentValue>v[0-9][^\\s]*)"
       ]
     },
     {
