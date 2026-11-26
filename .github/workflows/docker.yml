@@ -31,7 +31,7 @@ on:
           (v1.36.0+) An optional `node`, the command that runs the image's
           Node (`"node"`), does the same for its major version against the
           `node` pin in the nearest mise config from `context` up to the root.
-          (v1.38.0+) An optional `dotnet`, the command that runs the image's
+          (v1.39.0+) An optional `dotnet`, the command that runs the image's
           .NET host (`"dotnet"`), checks that every .NET runtime in the image
           has the major.minor of the `dotnet` SDK pin in the nearest mise
           config from `context` up to the root.
