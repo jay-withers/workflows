@@ -26,7 +26,7 @@ is `docs/delivery.md` in `jay-withers/factory`.
   terraform-deploy.yml        OIDC plan, optional apply, drift check, pending/failed issues
   terraform-unlock.yml        manual force-unlock of a stuck state lock
   container-apps-deploy.yml   gate, provenance check, make deploy, make smoke, rollback, Deployments_CL row
-  docker.yml                  build, optional push, Trivy, provenance + SBOM attestations, image Python and Node vs mise.toml
+  docker.yml                  build, optional push, Trivy, provenance + SBOM attestations, image Python, Node and .NET vs mise.toml
   pre-commit.yml              pre-commit run --all-files (optional Terraform toolchain)
   python.yml                  uv + pytest, optional ruff lint, coverage floor, diff-coverage gate, type check, Postgres
   go.yml                      Go from mise.toml + go test -race, go vet, gofmt, golangci-lint, tidy check, optional coverage floor and diff-coverage gate

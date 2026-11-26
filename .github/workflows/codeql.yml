@@ -21,7 +21,8 @@ on:
           JSON array of CodeQL languages to analyse, one job each, e.g.
           '["python", "actions"]' or '["go", "actions"]'. Every language is
           analysed without a build except `go`, which CodeQL cannot extract
-          without one: it gets `autobuild`, with Go from the caller's mise.toml
+          without one: it gets `autobuild`, with Go from the caller's mise.toml.
+          csharp (and java-kotlin) analyse from source with build-mode none
         type: string
         default: '["python", "actions"]'
       queries:
