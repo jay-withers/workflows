@@ -28,7 +28,8 @@ What each workflow then needs from `mise.toml`, failing with an error naming the
 | `pre-commit.yml` | `pre-commit`, plus whatever your hooks call: with `terraform: true`, `terraform`, `tflint`, `terraform-docs` and `checkov` | `python-version`, `node-version`, `terraform-version`, `terraform-docs-version`, `checkov-version` |
 | `python.yml` | `uv`, and `python` to choose the interpreter (exported as `UV_PYTHON`; without it uv picks one itself) | `python-version` |
 | `go.yml` (v1.33.0+) | `go`, plus `golangci-lint` while `lint` is on (v1.34.0+), in any mise config from `working-directory` up to the root. There is no fallback: without one the job fails | none |
-| `dotnet.yml` (v1.36.0+) | `dotnet` (the SDK, 10 or later), in any mise config from `working-directory` up to the root. There is no fallback: without one the job fails | none |
+| `node.yml` (v1.36.0+) | `node` (npm comes with it), in any mise config from `working-directory` up to the root. There is no fallback: without one the job fails | none |
+| `dotnet.yml` (v1.37.0+) | `dotnet` (the SDK, 10 or later), in any mise config from `working-directory` up to the root. There is no fallback: without one the job fails | none |
 
 `terraform.yml`'s change filter counts `mise.toml` as a Terraform change (v1.26.1+), so a Terraform bump there is validated. `tflint --init` still runs with `terraform: true`, authenticated with the job's token (v1.31.1+), so a hosted runner's shared anonymous GitHub API limit can't fail it. A repo without `mise.toml` sees no change. Renovate's shared `mise` preset keeps the versions current.
 
@@ -497,9 +498,73 @@ Notes:
 | `coverage-pr-comment` | `false` | Post the coverage report as one self-updating PR comment. Needs `coverage` and `pull-requests: write` on the caller |
 | `runs-on` | `ubuntu-latest` | Runner label |
 
+## Node CI
+
+(v1.36.0+) Runs a Node/TypeScript package's checks and test suite on the Node its `mise.toml` pins: `npm ci`, `npm audit signatures`, then the package's own `test` (or `test:coverage`), `typecheck`, `lint` and `format:check` scripts. Shaped like [Python CI](#python-ci) and [Go CI](#go-ci) on purpose, so a Node repo carries the same required check and the same gates.
+
+```yaml
+name: ci-node
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write  # only needed for coverage-pr-comment
+
+jobs:
+  test:
+    uses: jay-withers/workflows/.github/workflows/node.yml@main
+    with:
+      coverage: true
+      coverage-min: "90"
+      diff-coverage: "90"
+```
+
+The package needs these scripts in `package.json` (each check can be switched off with its input). [`tests/node`](tests/node) is a working example with vitest, TypeScript, ESLint and Prettier:
+
+```json
+"scripts": {
+  "typecheck": "tsc --noEmit",
+  "lint": "eslint .",
+  "format:check": "prettier --check .",
+  "test": "vitest run",
+  "test:coverage": "vitest run --coverage"
+}
+```
+
+Notes:
+
+- **The required status check is `<caller job id> / Test`**, the same as `python.yml`'s and `go.yml`'s, so a repo moving from Python to TypeScript keeps `test / Test` and its branch protection needs no change.
+- **Node comes from `mise.toml` and nowhere else**, as Go does for `go.yml`: no `node-version` input and no `setup-node` fallback. mise runs from `working-directory`, its Node goes first on `PATH` ahead of the runner image's, and the job fails naming the fix when no config pins `node`. npm is the one bundled with that Node.
+- **The checks are the package's own scripts**, not tools named in the workflow. Node has no one formatter, linter or test runner, and a script is what `make lint` and `make test` call locally, so CI and a laptop run the same command at the versions `package-lock.json` records. A missing script fails the job before anything runs, naming it and the input that switches it off. `typecheck`, `lint` and `format` run after the suite, pass or fail, so one push reports every finding. <!-- docs-check: ignore -->
+- **Installs are locked and verified.** `npm ci` fails when `package.json` and `package-lock.json` disagree (the counterpart of `python.yml`'s `locked` and `go.yml`'s `tidy`), and the job fails without a committed `package-lock.json`. `npm audit signatures` then checks every installed package against the registry's signatures. npm only: pnpm and Yarn lockfiles are not read.
+- **`ignore-scripts` (default on) installs with `--ignore-scripts`**, so no dependency's install script runs in CI. Turn it off only for a dependency that builds a native module at install time.
+- **Coverage is read from a Cobertura XML report.** With `coverage: true` the job runs `test:coverage` instead of `test`, which must write Cobertura to `coverage-file` (default `coverage/cobertura-coverage.xml`, where vitest and jest write it; vitest needs `cobertura` in `coverage.reporter`). The line total and a per-file table land in the job summary, and `coverage-pr-comment: true` posts them as one PR comment kept up to date across pushes. <!-- docs-check: ignore -->
+- **`coverage-min` is a floor on total line coverage**, from the report's own counts, checked after a passing suite on every event, so `main` is held to it as well as pull requests.
+- **`diff-coverage` gates the pull request's own lines**, exactly as in `python.yml` and `go.yml`: the same pinned `diff-cover` reads the report against `HEAD^1`, on `pull_request` after a passing suite. Its file paths are relative to the package directory, which diff-cover maps to the repository's.
+- **Permissions:** `contents: read`, plus `pull-requests: write` for the comment. Without it the comment logs a warning and the suite still passes. The workflow declares no permissions of its own, so set them on the caller.
+
+### Node inputs
+
+| Input | Default | Description |
+| --- | --- | --- |
+| `working-directory` | `.` | Directory holding `package.json` and `package-lock.json` |
+| `ignore-scripts` | `true` | Install with `npm ci --ignore-scripts` |
+| `typecheck` | `true` | Run the `typecheck` script after the suite |
+| `lint` | `true` | Run the `lint` script after the suite |
+| `format` | `true` | Run the `format:check` script after the suite |
+| `coverage` | `false` | Run `test:coverage` instead of `test`, reading its Cobertura report. Reported; gated only by the two inputs below |
+| `coverage-file` | `coverage/cobertura-coverage.xml` | Where `test:coverage` writes the Cobertura report, relative to `working-directory` <!-- docs-check: ignore --> |
+| `coverage-min` | `""` | Minimum total line coverage. Empty gates nothing. Needs `coverage` |
+| `diff-coverage` | `""` | Minimum % of the PR's changed lines the suite must run. Empty gates nothing. Needs `coverage` |
+| `coverage-pr-comment` | `false` | Post the coverage report as one self-updating PR comment. Needs `coverage` and `pull-requests: write` on the caller |
+| `runs-on` | `ubuntu-latest` | Runner label |
+
 ## .NET CI
 
-(v1.36.0+) Builds and tests a .NET solution on the SDK its `mise.toml` pins: a locked restore, `dotnet build` with warnings as errors, `dotnet test` on Microsoft.Testing.Platform, then `dotnet format`. Shaped like [Python CI](#python-ci) and [Go CI](#go-ci) on purpose, so a .NET repo carries the same required check and the same gates.
+(v1.37.0+) Builds and tests a .NET solution on the SDK its `mise.toml` pins: a locked restore, `dotnet build` with warnings as errors, `dotnet test` on Microsoft.Testing.Platform, then `dotnet format`. Shaped like [Python CI](#python-ci), [Go CI](#go-ci) and [Node CI](#node-ci) on purpose, so a .NET repo carries the same required check and the same gates.
 
 ```yaml
 name: ci-dotnet
@@ -531,7 +596,7 @@ What the repository needs, all of it in [`tests/dotnet`](tests/dotnet):
 
 Notes:
 
-- **The required status check is `<caller job id> / Test`**, the same as `python.yml`'s and `go.yml`'s, so a repo moving from Python to .NET keeps `test / Test` and its branch protection needs no change.
+- **The required status check is `<caller job id> / Test`**, the same as `python.yml`'s, `go.yml`'s and `node.yml`'s, so a repo moving from Python to .NET keeps `test / Test` and its branch protection needs no change.
 - **The SDK comes from `mise.toml` and nowhere else.** There is no `dotnet-version` input and no `setup-dotnet` fallback. mise runs from `working-directory`, and the job fails naming the fix when no config from there up to the root pins `dotnet`. mise's SDK goes first on `PATH`, with `DOTNET_ROOT` pointing at it, ahead of the SDK the runner image has.
 - **Tests run on Microsoft.Testing.Platform only.** It is what `dotnet test` runs from the .NET 10 SDK on, once `global.json` opts in, and what current xunit.v3, MSTest and TUnit releases are built for. On SDK 10+ they refuse the older VSTest mode. The job checks for the opt-in first, looking up from `working-directory` as the SDK does, and fails naming the fix.
 - **`locked` (default on) restores with `--locked-mode`**, the counterpart of `python.yml`'s `locked` and `go.yml`'s `tidy`. NuGet fails when a lock file disagrees with the projects (NU1004), and the job also fails when the restore creates or changes a `packages.lock.json`, or when a tracked `.csproj`, `.fsproj` or `.vbproj` has no committed lock file beside it. The NuGet package cache is keyed on the SDK and every lock file.
@@ -615,6 +680,7 @@ Notes:
 - **A push attests each image** (`attest`, on by default): a [build provenance](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations) attestation over the pushed digest, and, with `scan`, a CycloneDX SBOM from Trivy. Both are signed with the run's OIDC identity and pushed to GitHub's attestation store and the registry. The caller grants `id-token: write` and `attestations: write`, beside `packages: write`. Without `id-token: write` the image still ships, with a warning, and a deploy that verifies it refuses it. Check one by hand with `gh attestation verify oci://<image>:<tag> --owner jay-withers`.
 - `platforms` is one platform by default. A manifest list with a single entry buys nothing, and a runtime that only ever runs amd64 pays for every other architecture in build minutes.
 - **`"python"` on an image checks its interpreter against `mise.toml` (v1.35.0+).** Set it to the command that starts the image's Python (`{"name": "api", "context": ".", "python": "python"}`; `"python3"` for an image whose Python is the distribution's). On a build that does not push, every pull request and the daily build of `main`, the job runs that command in the built image and fails unless its major.minor matches the `python` pin in the repository root's `mise.toml`, which a local test run and `python.yml`'s suite run on. The two are pinned in different places (the base image is often another repository's), and nothing else compares them, so a green suite could otherwise say nothing about the interpreter that ships. It reads `[tools].python` from `mise.toml` or `.mise.toml`, as a string, a list (the first) or a table's `version`. Patch versions may differ. It runs after the Trivy scan and upload, so a mismatch never hides findings, and a multi-platform build (never loaded) skips it with a warning. Add `mise.toml` to the caller's image path filter, so a Python bump there runs the check too.
+- **`"node"` on an image does the same for Node (v1.36.0+).** Set it to the command that starts the image's Node (`{"name": "web", "context": ".", "node": "node"}`). The job fails unless the image's Node major matches the `node` pin mise would use in the image's build context: the nearest `mise.toml` or `.mise.toml` from `context` up to the root that pins `node`, which is what a local run and `node.yml`'s suite (with `working-directory` set to the context) run on. Major only, since Node's release lines are its majors. The pin must be a number (`"26"`, `"26.13.1"`): an alias such as `"lts"` names no one version, so it fails the check. Like the Python check, it runs on builds that do not push, after the scan, and a multi-platform build skips it with a warning.
 
 ### Vulnerability scanning
 
@@ -662,7 +728,7 @@ jobs:
 
 | Input | Default | Description |
 | --- | --- | --- |
-| `images` | *required* | JSON array of `{"name", "context"}` objects. `name` is the last segment of the reference and the cache scope; `context` is the build context. One matrix leg each. (v1.35.0+) An optional `"python"` names the command that runs the image's interpreter, checked against `mise.toml`'s pin |
+| `images` | *required* | JSON array of `{"name", "context"}` objects. `name` is the last segment of the reference and the cache scope; `context` is the build context. One matrix leg each. (v1.35.0+) An optional `"python"` names the command that runs the image's interpreter, checked against `mise.toml`'s pin. (v1.36.0+) An optional `"node"` does the same for Node's major version |
 | `ref` | `""` | Git ref to check out. Empty uses the event default. Set to the tag on a release |
 | `push` | `false` | Push the images. Keep false on pull requests |
 | `tags` | `""` | Whitespace- or newline-separated tag *values* (not full references) applied to every image. Required when pushing |
@@ -762,7 +828,7 @@ Notes:
 
 This repo dogfoods its own reusable workflows by calling them with local paths (no `@ref` needed). These callers are prefixed `_self_` to distinguish them from the public reusable workflows — they are internal and not meant to be consumed by other repos:
 
-- [`_self_ci.yml`](.github/workflows/_self_ci.yml) calls [`pre-commit.yml`](.github/workflows/pre-commit.yml) on every push and pull request — the hooks in [`.pre-commit-config.yaml`](.pre-commit-config.yaml) cover actionlint, gitleaks secret scanning and file hygiene. It also calls [`go.yml`](.github/workflows/go.yml) against the sample module in [`tests/go`](tests/go) with every gate but the PR comment on (format, lint, and both coverage floors at 90%), so a change to `go.yml` runs before any caller's pin moves. That job is not a required check. The diff-coverage gate only meets real lines on a PR that changes `tests/go/calc`, so touch it when changing how coverage is converted. A `dotnet` job does the same for [`dotnet.yml`](.github/workflows/dotnet.yml) against the sample solution in [`tests/dotnet`](tests/dotnet) (touch `tests/dotnet/src/Calc` when changing how coverage is merged or diffed).
+- [`_self_ci.yml`](.github/workflows/_self_ci.yml) calls [`pre-commit.yml`](.github/workflows/pre-commit.yml) on every push and pull request — the hooks in [`.pre-commit-config.yaml`](.pre-commit-config.yaml) cover actionlint, gitleaks secret scanning and file hygiene. It also calls [`go.yml`](.github/workflows/go.yml) against the sample module in [`tests/go`](tests/go) with every gate but the PR comment on (format, lint, and both coverage floors at 90%), so a change to `go.yml` runs before any caller's pin moves. That job is not a required check. The diff-coverage gate only meets real lines on a PR that changes `tests/go/calc`, so touch it when changing how coverage is converted. A `node` job does the same for [`node.yml`](.github/workflows/node.yml) against the sample package in [`tests/node`](tests/node), whose diff-coverage meets real lines on a PR that changes `tests/node/src`. A `dotnet` job does the same for [`dotnet.yml`](.github/workflows/dotnet.yml) against the sample solution in [`tests/dotnet`](tests/dotnet) (touch `tests/dotnet/src/Calc` when changing how coverage is merged or diffed).
 - [`_self_codeql.yml`](.github/workflows/_self_codeql.yml) calls [`codeql.yml`](.github/workflows/codeql.yml) with `languages: '["actions"]'`, scanning this repo's own workflow files, which are the only code here.
 - [`_self_cd.yml`](.github/workflows/_self_cd.yml) calls [`release.yml`](.github/workflows/release.yml) on pushes to `main` with `update-major-tag: true`, so callers can pin to `@v1`.
 - Every external action is pinned to a full commit SHA with the version in a trailing comment. A pre-commit hook (`pin-github-actions`) enforces this in CI, and Renovate keeps the pins up to date.

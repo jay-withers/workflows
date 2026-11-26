@@ -28,6 +28,9 @@ on:
           interpreter (`"python"`, `"python3"`), checks on a build that does
           not push that its major.minor matches the `python` pin in the
           repository root's mise.toml, which local runs and CI test on.
+          (v1.36.0+) An optional `node`, the command that runs the image's
+          Node (`"node"`), does the same for its major version against the
+          `node` pin in the nearest mise config from `context` up to the root.
         required: true
         type: string
       ref:
@@ -255,8 +258,8 @@ jobs:
           # A pull request build is loaded into the local daemon under a
           # local-only tag so Trivy can scan it; a pushed build is scanned
           # from the registry instead. Loading needs a single platform.
-          # The Python check (below) runs the loaded image too.
-          load: ${{ !inputs.push && (inputs.scan || matrix.image.python != '') && !contains(inputs.platforms, ',') }}
+          # The Python and Node checks (below) run the loaded image too.
+          load: ${{ !inputs.push && (inputs.scan || matrix.image.python != '' || matrix.image.node != '') && !contains(inputs.platforms, ',') }}
           # The local tag only on a build that does not push: pushed, it would
           # go to Docker Hub.
           tags: |
@@ -446,6 +449,76 @@ jobs:
           fi
           echo "$NAME's image runs Python $image, as $config pins."
 
+      # The Node counterpart of the Python check above, for what node.yml's
+      # suite runs on. Major only: Node's release lines are its majors, and a
+      # minor within one changes nothing a suite would see. mise.toml must pin
+      # a number; an alias such as "lts" names no one version to compare.
+      #
+      # The pin is the one mise would use in the image's build context: the
+      # nearest mise.toml or .mise.toml from the context up to the repository
+      # root that pins node. That is the config node.yml's suite runs on when
+      # its working-directory is the context, so a package in a subdirectory
+      # with its own pin (as tests/node has) is compared with that pin, not
+      # the root's.
+      - name: Check ${{ matrix.image.name }}'s Node matches mise.toml
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && !inputs.push && matrix.image.node != '' && !contains(inputs.platforms, ',') }}
+        env:
+          NODE_COMMAND: ${{ matrix.image.node }}
+          LOCAL_REF: local-scan/${{ matrix.image.name }}:${{ github.run_id }}
+          NAME: ${{ matrix.image.name }}
+          CONTEXT: ${{ matrix.image.context }}
+        run: |
+          # tomllib, as for Python: a string, a list (the first is the
+          # default) or a table with `version`, and only [tools] counts.
+          # Prints "<config>\t<major>", "<config>\t" for a pin that is not a
+          # number, or nothing when no config pins node.
+          found="$(python3 - "${CONTEXT:-.}" <<'PY'
+          import os, re, sys, tomllib
+          root = os.path.realpath(".")
+          here = os.path.realpath(sys.argv[1])
+          if os.path.commonpath([root, here]) != root:
+              here = root
+          while True:
+              for name in ("mise.toml", ".mise.toml"):
+                  path = os.path.join(here, name)
+                  if not os.path.isfile(path):
+                      continue
+                  tool = tomllib.load(open(path, "rb")).get("tools", {}).get("node")
+                  if tool is None:
+                      continue
+                  if isinstance(tool, list):
+                      tool = tool[0] if tool else None
+                  if isinstance(tool, dict):
+                      tool = tool.get("version")
+                  match = re.match(r"v?(\d+)(\.|$)", str(tool or ""))
+                  print(f"{os.path.relpath(path, root)}\t{match[1] if match else ''}")
+                  sys.exit(0)
+              if here == root:
+                  break
+              here = os.path.dirname(here)
+          PY
+          )"
+          if [ -z "$found" ]; then
+            echo "::error::$NAME sets node, but no mise.toml from its context (${CONTEXT:-.}) up to the repository root pins node."
+            exit 1
+          fi
+          config="${found%%$'\t'*}"
+          pinned="${found#*$'\t'}"
+          if [ -z "$pinned" ]; then
+            echo "::error::$NAME sets node, but $config pins no node X[.Y.Z] under [tools]."
+            exit 1
+          fi
+          image="$(docker run --rm --entrypoint "$NODE_COMMAND" "$LOCAL_REF" \
+            -p 'process.versions.node.split(".")[0]')" || {
+            echo "::error::Could not run '$NODE_COMMAND' in $NAME's image. Set node to the command that starts it."
+            exit 1
+          }
+          if [ "$image" != "$pinned" ]; then
+            echo "::error::$NAME's image runs Node $image, but $config pins $pinned, which local runs and CI test on. Move them together: the base image's Node and $config's node."
+            exit 1
+          fi
+          echo "$NAME's image runs Node $image, as $config pins."
+
       # Not run on a multi-platform build, which is never loaded into the
       # daemon; said so rather than skipped silently.
       - name: Note the skipped Python check
@@ -453,6 +526,12 @@ jobs:
         env:
           NAME: ${{ matrix.image.name }}
         run: echo "::warning::$NAME sets python, but a multi-platform build is not loaded to run it, so its Python was not compared with mise.toml. Build one platform on pull requests to check it."
+
+      - name: Note the skipped Node check
+        if: ${{ !inputs.push && matrix.image.node != '' && contains(inputs.platforms, ',') }}
+        env:
+          NAME: ${{ matrix.image.name }}
+        run: echo "::warning::$NAME sets node, but a multi-platform build is not loaded to run it, so its Node was not compared with mise.toml. Build one platform on pull requests to check it."
 
       - name: Refuse fixable ${{ inputs.scan-fail-on }} vulnerabilities
         if: steps.scan.outputs.gate != '' && steps.scan.outputs.gate != '0'
@@ -521,14 +600,14 @@ jobs:
           fi
           if [ "$OUTCOME" = "failure" ]; then
             gh label create "$label" -R "$REPOSITORY" --color B60205 \
-              --description "The image no longer builds, passes Trivy, or matches mise.toml's Python on main. Closed by the next success." 2>/dev/null || true
+              --description "The image no longer builds, passes Trivy, or matches mise.toml's Python or Node on main. Closed by the next success." 2>/dev/null || true
             if [ -n "$existing" ]; then
               gh issue comment "$existing" -R "$REPOSITORY" --body "Failed again: $RUN_URL" > /dev/null
             else
               body="$(printf '%s\n%s\n\n%s\n\n%s\n' "$MARKER" \
-                "@$OWNER The image build on \`$REF\` failed: it no longer builds, Trivy found a fixable CRITICAL/HIGH vulnerability, or its Python no longer matches mise.toml's (the log names which). Every pull request's \`container-build\` check fails the same way until it is fixed, so Renovate's PRs stop merging." \
+                "@$OWNER The image build on \`$REF\` failed: it no longer builds, Trivy found a fixable CRITICAL/HIGH vulnerability, or its Python or Node no longer matches mise.toml's (the log names which). Every pull request's \`container-build\` check fails the same way until it is fixed, so Renovate's PRs stop merging." \
                 "Run: $RUN_URL" \
-                "Fix it on main (bump the base image or package, accept the risk in \`.trivyignore\`, or move the base image's Python and mise.toml's python together). This issue closes itself on the next successful build.")"
+                "Fix it on main (bump the base image or package, accept the risk in \`.trivyignore\`, or move the base image's Python or Node and mise.toml's pin together). This issue closes itself on the next successful build.")"
               gh issue create -R "$REPOSITORY" --title "Image build on $REF failed" --label "$label" --body "$body" > /dev/null
             fi
           elif [ -n "$existing" ]; then
