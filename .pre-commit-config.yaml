@@ -30,10 +30,13 @@ repos:
         args:
           - --autofix
           - --indent=2
-        # Exclude non-standard JSON
+        # Exclude non-standard JSON, and tests/node's, which npm writes
+        # (package.json, package-lock.json) and the sample's own Prettier
+        # checks: sorting their keys here would fight both.
         exclude: |
           (?x)^(
               .vscode/tasks.json
+              |tests/node/.*\.json
           )$
 
       - id: trailing-whitespace

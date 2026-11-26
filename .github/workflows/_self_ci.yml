@@ -1,5 +1,5 @@
-# Internal: this repo's own use of the reusable pre-commit.yml and go.yml
-# workflows. Not part of the public API — other repos should call them directly.
+# Internal: this repo's own use of the reusable pre-commit.yml, go.yml and
+# node.yml workflows. Not part of the public API — other repos should call them directly.
 name: CI
 
 on:
@@ -25,6 +25,18 @@ jobs:
     uses: ./.github/workflows/go.yml
     with:
       working-directory: tests/go
+      coverage: true
+      coverage-min: "90"
+      diff-coverage: "90"
+
+  # The same self-test for node.yml, against the sample package in
+  # tests/node: every gate on but the PR comment. Touch tests/node/src on a PR
+  # that changes how coverage is read, so diff-coverage meets real lines. Not
+  # a required check either.
+  node:
+    uses: ./.github/workflows/node.yml
+    with:
+      working-directory: tests/node
       coverage: true
       coverage-min: "90"
       diff-coverage: "90"

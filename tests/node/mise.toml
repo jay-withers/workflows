@@ -1,0 +1,5 @@
+# The Node that _self_ci.yml's node.yml self-test runs. node.yml takes Node
+# (and the npm bundled with it) from mise.toml and nowhere else, so this
+# package pins its own; mise merges it with the repository root's tools.
+[tools]
+node = "26.13.1"
