@@ -1,0 +1,427 @@
+name: .NET
+
+# Reusable .NET CI: build and test a solution.
+#
+# The .NET counterpart of python.yml and go.yml, shaped like them on purpose
+# so a .NET repo carries the same required check (`<caller job> / Test`, so
+# `test / Test`) and the same gates. One job builds with warnings as errors
+# (the analyzers and, with EnforceCodeStyleInBuild, code style: the lint),
+# checks `dotnet format` would change nothing (the formatter), runs the suite
+# and measures coverage, so a .NET repo's `test / Test` alone says the code is
+# tidy and works.
+#
+# The SDK comes from the caller's mise.toml and nowhere else, as go.yml does
+# with Go: a setup-dotnet fallback would be a second pin that drifts.
+#
+# Tests run on Microsoft.Testing.Platform (MTP), the runner `dotnet test`
+# uses from the .NET 10 SDK on when global.json opts in. The VSTest mode it
+# replaces is the legacy path: xunit.v3, MSTest and TUnit's current releases
+# are MTP-native, and on SDK 10+ refuse VSTest outright. Supporting both
+# would mean two coverage collectors and two argument shapes for one check,
+# so this workflow supports MTP only and says so at its first step. Coverage
+# comes from Microsoft.Testing.Extensions.CodeCoverage, the platform's own
+# collector, which the caller's test projects reference.
+#
+# Like python.yml and go.yml, deliberately no internal path filter: the
+# required check always reports.
+#
+# Every gate runs inside the one job, so turning one on adds no new required
+# check: `locked` (restore matches the committed packages.lock.json files, the
+# counterpart of `uv --locked` and go.yml's tidy), `warnings-as-errors`,
+# `format`, `coverage-min` (a floor on the total) and `diff-coverage` (a floor
+# on how much of the code a pull request changes is run by a test).
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Directory holding the solution (or project) and, at or above it, global.json
+        type: string
+        default: "."
+      project:
+        description: >-
+          The .sln, .slnx or .csproj to build and test, relative to
+          working-directory. Empty lets the SDK find the one solution or
+          project in working-directory
+        type: string
+        default: ""
+      configuration:
+        description: Build configuration
+        type: string
+        default: Release
+      locked:
+        description: >-
+          Restore in locked mode and fail unless every project's
+          packages.lock.json is committed and unchanged by the restore.
+          Needs RestorePackagesWithLockFile=true (Directory.Build.props)
+        type: boolean
+        default: true
+      warnings-as-errors:
+        description: >-
+          Build with -warnaserror, so compiler, analyzer and (with
+          EnforceCodeStyleInBuild) code-style warnings fail the job
+        type: boolean
+        default: true
+      format:
+        description: Fail if `dotnet format` (whitespace, style and analyzers) would change any file
+        type: boolean
+        default: true
+      coverage:
+        description: >-
+          Measure line coverage with Microsoft.Testing.Extensions.CodeCoverage,
+          which every test project must reference. Reported into the job
+          summary, and gated only by `coverage-min` (the total) and
+          `diff-coverage` (the pull request's own lines)
+        type: boolean
+        default: false
+      coverage-pr-comment:
+        description: >-
+          Post the coverage report as a single PR comment, updated in place on
+          every run. Needs `pull-requests: write` on the caller; without it the
+          comment logs a warning and the suite still passes
+        type: boolean
+        default: false
+      diff-coverage:
+        description: >-
+          Minimum percentage of the lines a pull request changes that the
+          suite must run, e.g. "90". Empty gates nothing. Needs `coverage`.
+          Only the pull request's own lines count, and a pull request that
+          changes no measured code passes
+        type: string
+        default: ""
+      coverage-min:
+        description: >-
+          Minimum total line coverage, e.g. "90". Empty gates nothing. Needs
+          `coverage`. Checked after a passing suite, on every event, so main
+          is held to it as well as pull requests
+        type: string
+        default: ""
+      runs-on:
+        description: Runner label
+        type: string
+        default: ubuntu-latest
+
+jobs:
+  test:
+    # The check name is API: callers' required checks read `<job> / Test`.
+    name: Test
+    runs-on: ${{ inputs.runs-on }}
+    # No `permissions` block, for the same reason as python.yml: a pinned
+    # `contents: read` here would make coverage-pr-comment's
+    # `pull-requests: write` unobtainable whatever the caller grants.
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+      DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "1"
+      # Outside the workspace, so the cache step saves one fixed path and
+      # `git status` in the locked check never sees it.
+      NUGET_PACKAGES: ${{ github.workspace }}/../.nuget/packages
+    steps:
+      # First, so a misconfigured caller hears in seconds.
+      - name: Check inputs
+        env:
+          COVERAGE: ${{ inputs.coverage }}
+          COMMENT: ${{ inputs.coverage-pr-comment }}
+          DIFF_COVERAGE: ${{ inputs.diff-coverage }}
+          COVERAGE_MIN: ${{ inputs.coverage-min }}
+        run: |
+          for name in diff-coverage coverage-min; do
+            if [ "$name" = diff-coverage ]; then value="$DIFF_COVERAGE"; else value="$COVERAGE_MIN"; fi
+            [ -n "$value" ] || continue
+            if [ "$COVERAGE" != "true" ]; then
+              echo "::error::$name needs coverage: true."
+              exit 1
+            fi
+            if ! [[ "$value" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+              echo "::error::$name must be a plain number such as 90, not '$value'."
+              exit 1
+            fi
+          done
+          if [ "$COMMENT" = "true" ] && [ "$COVERAGE" != "true" ]; then
+            echo "::error::coverage-pr-comment needs coverage: true."
+            exit 1
+          fi
+
+      # Depth 2 on a pull request: the merge commit's first parent is the base
+      # branch as merged against, which diff-coverage diffs against.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 1 }}
+
+      # Run from the solution's directory: mise reads every config from there
+      # up to the repository root, so a solution in a subdirectory can pin its
+      # SDK beside it and still inherit the root's tools.
+      - name: Setup mise
+        uses: jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a # v5.2.10
+        with:
+          working_directory: ${{ github.workspace }}/${{ inputs.working-directory }}
+
+      - name: Check the SDK comes from mise and tests run on MTP
+        id: dotnet
+        working-directory: ${{ inputs.working-directory }}
+        # `mise which`, not `command -v`: the runner image has a .NET SDK of
+        # its own, which would otherwise pass this check and build on a
+        # version nothing pinned.
+        run: |
+          if ! dotnet="$(mise which dotnet 2>/dev/null)"; then
+            echo "::error::No mise config from ${PWD#"$GITHUB_WORKSPACE"/} up to the repository root pins dotnet. Add it, e.g. \`mise use dotnet@<version>\`."
+            exit 1
+          fi
+          bindir="$(dirname "$dotnet")"
+          # First on PATH for every later step, ahead of the image's SDK, and
+          # DOTNET_ROOT with it, so an apphost (the MTP test executables)
+          # finds this runtime rather than the image's.
+          echo "$bindir" >> "$GITHUB_PATH"
+          echo "DOTNET_ROOT=$bindir" >> "$GITHUB_ENV"
+          PATH="$bindir:$PATH"
+          version="$("$dotnet" --version)"
+          echo "SDK $version from $dotnet"
+          if [ "${version%%.*}" -lt 10 ]; then
+            echo "::error::mise pins .NET SDK $version. dotnet.yml needs 10 or later, the first whose \`dotnet test\` runs Microsoft.Testing.Platform."
+            exit 1
+          fi
+          # global.json is looked up from the working directory upwards, as
+          # the SDK does. Without the opt-in, `dotnet test` falls back to
+          # VSTest, which an MTP test project refuses with a less direct error.
+          dir="$PWD"
+          config=""
+          while :; do
+            if [ -f "$dir/global.json" ]; then config="$dir/global.json"; break; fi
+            [ "$dir" = "$GITHUB_WORKSPACE" ] || [ "$dir" = / ] && break
+            dir="$(dirname "$dir")"
+          done
+          runner=""
+          if [ -n "$config" ]; then
+            runner="$(jq -r '.test.runner // empty' "$config")"
+          fi
+          if [ "$runner" != "Microsoft.Testing.Platform" ]; then
+            echo "::error::dotnet.yml runs tests on Microsoft.Testing.Platform. Add \`\"test\": {\"runner\": \"Microsoft.Testing.Platform\"}\` to global.json at or above ${PWD#"$GITHUB_WORKSPACE"/}${config:+ (found ${config#"$GITHUB_WORKSPACE"/})}."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # Keyed on the SDK and every lock file, plus the run id: actions/cache
+      # never re-saves a key it hit, so without a per-run suffix the cache
+      # would freeze at its first save. Restores fall back to the newest cache
+      # for the same SDK. NuGet checks every package's hash against the lock
+      # file, so a stale entry costs a download, never a wrong result.
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.NUGET_PACKAGES }}
+          key: nuget-${{ runner.os }}-${{ runner.arch }}-${{ steps.dotnet.outputs.version }}-${{ hashFiles(format('{0}/**/packages.lock.json', inputs.working-directory)) }}-${{ github.run_id }}
+          restore-keys: |
+            nuget-${{ runner.os }}-${{ runner.arch }}-${{ steps.dotnet.outputs.version }}-${{ hashFiles(format('{0}/**/packages.lock.json', inputs.working-directory)) }}-
+            nuget-${{ runner.os }}-${{ runner.arch }}-${{ steps.dotnet.outputs.version }}-
+
+      # --locked-mode fails when a lock file disagrees with the projects, but
+      # quietly restores (and writes one) where a project has none, so the
+      # check after it is what makes a missing or stale lock file an error.
+      - name: Restore
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PROJECT: ${{ inputs.project }}
+          LOCKED: ${{ inputs.locked }}
+        run: |
+          args=()
+          [ -n "$PROJECT" ] && args+=("$PROJECT")
+          if [ "$LOCKED" = "true" ]; then
+            args+=(--locked-mode)
+          fi
+          if ! dotnet restore "${args[@]}"; then
+            if [ "$LOCKED" = "true" ]; then
+              echo "::error::Restore failed. If NuGet says a lock file is out of date (NU1004), run \`dotnet restore\` and commit the lock files it changes."
+            fi
+            exit 1
+          fi
+          if [ "$LOCKED" = "true" ]; then
+            # Every tracked project, not just the ones restored: a project
+            # that opts out of RestorePackagesWithLockFile writes no lock
+            # file, which the status check below would never see.
+            missing=()
+            while IFS= read -r proj; do
+              lock="$(dirname "$proj")/packages.lock.json"
+              git ls-files --error-unmatch -- "$lock" >/dev/null 2>&1 || missing+=("$proj")
+            done < <(git ls-files -- '*.csproj' '*.fsproj' '*.vbproj')
+            if [ "${#missing[@]}" -gt 0 ]; then
+              echo "::error::locked is on, and these projects have no committed packages.lock.json beside them. Set RestorePackagesWithLockFile to true (Directory.Build.props), run \`dotnet restore\` and commit the lock files, or set locked: false."
+              printf '%s\n' "${missing[@]}"
+              exit 1
+            fi
+            changed="$(git status --porcelain --untracked-files=all -- '*packages.lock.json')"
+            if [ -n "$changed" ]; then
+              echo "::error::Restoring changed or created these lock files. Run \`dotnet restore\` and commit the result."
+              echo "$changed"
+              git diff -- '*packages.lock.json'
+              exit 1
+            fi
+          fi
+
+      - name: Build
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PROJECT: ${{ inputs.project }}
+          CONFIGURATION: ${{ inputs.configuration }}
+          WARNINGS_AS_ERRORS: ${{ inputs.warnings-as-errors }}
+        run: |
+          args=(--no-restore --configuration "$CONFIGURATION")
+          [ -n "$PROJECT" ] && args=("$PROJECT" "${args[@]}")
+          if [ "$WARNINGS_AS_ERRORS" = "true" ]; then
+            # Except NuGet's vulnerability audit (NU1900-NU1904), which the
+            # build replays from restore: a new advisory for any transitive
+            # package would otherwise fail every PR, whatever it changed.
+            # The image's Trivy gate is where a fixable one fails.
+            args+=(-warnaserror "-warnnotaserror:NU1900,NU1901,NU1902,NU1903,NU1904")
+          fi
+          dotnet build "${args[@]}"
+
+      # `--solution` or `--project`, not a positional path: MTP's `dotnet test`
+      # takes only the named options. Coverage files land in TestResults with
+      # generated names, one per test project, so several never overwrite
+      # each other; the report step merges them.
+      - name: Run dotnet test
+        id: suite
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PROJECT: ${{ inputs.project }}
+          CONFIGURATION: ${{ inputs.configuration }}
+          COVERAGE: ${{ inputs.coverage }}
+        run: |
+          # Absolute, so the files land here whatever directory each test
+          # app runs from.
+          args=(--no-build --configuration "$CONFIGURATION" --results-directory "$PWD/TestResults")
+          case "$PROJECT" in
+            "") ;;
+            *.sln|*.slnx|*.slnf) args+=(--solution "$PROJECT") ;;
+            *) args+=(--project "$PROJECT") ;;
+          esac
+          if [ "$COVERAGE" = "true" ]; then
+            args+=(--coverage --coverage-output-format cobertura)
+          fi
+          dotnet test "${args[@]}"
+
+      # Runs when the suite ran, pass or fail, so one push reports both a
+      # failing test and a formatting finding. --no-restore: the restore
+      # above already ran, and a format check must not rewrite lock files.
+      - name: Format
+        if: ${{ !cancelled() && inputs.format && (steps.suite.outcome == 'success' || steps.suite.outcome == 'failure') }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PROJECT: ${{ inputs.project }}
+        run: |
+          args=(--verify-no-changes --no-restore)
+          [ -n "$PROJECT" ] && args=("$PROJECT" "${args[@]}")
+          if ! dotnet format "${args[@]}"; then
+            echo "::error::dotnet format would change the files above. Run \`dotnet format\` (or \`make lint\`) and commit the result."
+            exit 1
+          fi
+
+      # ReportGenerator merges every test project's Cobertura file into one,
+      # which the floor, diff-cover and the comment all read, and writes the
+      # Markdown summary. Pinned, because its arithmetic decides a required
+      # check, and run with `dotnet tool exec` (SDK 10+), so nothing is
+      # installed. renovate.json's regex manager keeps the pin current.
+      # Whenever the suite ran, pass or fail, because a failing suite is
+      # exactly when the reader wants to know what the tests reached.
+      - name: Report coverage
+        id: report
+        if: ${{ !cancelled() && inputs.coverage && (steps.suite.outcome == 'success' || steps.suite.outcome == 'failure') }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          SUITE: ${{ steps.suite.outcome }}
+        run: |
+          shopt -s globstar nullglob
+          reports=(TestResults/**/*.cobertura.xml)
+          if [ "${#reports[@]}" -eq 0 ]; then
+            # A suite that failed may have stopped before writing any, and
+            # its own log has the cause.
+            if [ "$SUITE" = "failure" ]; then
+              echo "::warning::The failed suite wrote no Cobertura file, so there is no coverage to report."
+              exit 0
+            fi
+            echo "::error::coverage is on, and the suite wrote no Cobertura file. Every test project needs a PackageReference to Microsoft.Testing.Extensions.CodeCoverage."
+            exit 1
+          fi
+          joined="$(IFS=';'; echo "${reports[*]}")"
+          dotnet tool exec dotnet-reportgenerator-globaltool@5.6.1 --yes -- \
+            "-reports:$joined" -targetdir:coverage \
+            "-reporttypes:Cobertura;MarkdownSummaryGithub" -verbosity:Warning
+          cp coverage/SummaryGithub.md coverage.md
+          { echo "## Coverage"; echo; cat coverage.md; } >> "$GITHUB_STEP_SUMMARY"
+
+      # A floor on the total, checked on every event after a passing suite, so
+      # main is held to it as well as pull requests. A failing suite already
+      # fails the job, and its coverage measures nothing.
+      - name: Coverage floor
+        if: ${{ !cancelled() && steps.suite.outcome == 'success' && steps.report.outcome == 'success' && inputs.coverage-min != '' }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          COVERAGE_MIN: ${{ inputs.coverage-min }}
+        run: |
+          rate="$(sed -n 's/.*<coverage [^>]*line-rate="\([0-9.]*\)".*/\1/p' coverage/Cobertura.xml | head -n 1)"
+          if [ -z "$rate" ]; then
+            echo "::error::Could not read a line-rate from coverage/Cobertura.xml."
+            exit 1
+          fi
+          total="$(awk -v r="$rate" 'BEGIN { printf "%.2f", r * 100 }')"
+          if awk -v t="$total" -v m="$COVERAGE_MIN" 'BEGIN { exit !(t + 0 < m + 0) }'; then
+            echo "::error::Total line coverage is ${total}%, under the ${COVERAGE_MIN}% floor."
+            exit 1
+          fi
+          echo "Total line coverage ${total}% meets the ${COVERAGE_MIN}% floor."
+
+      # The merged Cobertura file names each source by its absolute path,
+      # which diff-cover maps back to the repository-relative paths in
+      # `git diff`. Same tool and version as python.yml's and go.yml's.
+      - name: Setup uv
+        if: ${{ !cancelled() && steps.suite.outcome == 'success' && steps.report.outcome == 'success' && inputs.diff-coverage != '' && github.event_name == 'pull_request' }}
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+
+      # Compared with HEAD^1, the merge commit's base-branch parent. Only after
+      # a passing suite: a failed test leaves coverage that measures nothing.
+      - name: Diff coverage
+        if: ${{ !cancelled() && steps.suite.outcome == 'success' && steps.report.outcome == 'success' && inputs.diff-coverage != '' && github.event_name == 'pull_request' }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          DIFF_COVERAGE: ${{ inputs.diff-coverage }}
+        run: |
+          status=0
+          uv tool run diff-cover@11.0.4 coverage/Cobertura.xml \
+            --compare-branch=HEAD^1 --fail-under="$DIFF_COVERAGE" \
+            --format markdown:diff-coverage.md || status=$?
+          if [ ! -f diff-coverage.md ]; then
+            echo "::error::diff-cover failed before writing a report (exit $status). Its log above has the cause; this is not a coverage result."
+            exit 1
+          fi
+          cat diff-coverage.md >> "$GITHUB_STEP_SUMMARY"
+          { echo; cat diff-coverage.md; } >> coverage.md
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Under $DIFF_COVERAGE% of the lines this pull request changes are run by a test. The summary lists them."
+          fi
+          exit "$status"
+
+      # One comment kept up to date, matched on an HTML marker, exactly as
+      # python.yml and go.yml do, each with its own marker.
+      - name: Comment coverage on the pull request
+        if: ${{ always() && inputs.coverage && inputs['coverage-pr-comment'] && github.event_name == 'pull_request' }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          [ -f coverage.md ] || exit 0
+          marker='<!-- jay-withers/workflows: dotnet coverage -->'
+          printf '%s\n## Coverage\n\n' "$marker" > comment.md
+          cat coverage.md >> comment.md
+          existing=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            --jq "map(select(.body | startswith(\"$marker\")))[0].id // empty")
+          # Never fatal: a read-only token (a fork, or a caller that did not
+          # grant pull-requests: write) must not fail a suite that passed.
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$existing" -F body=@comment.md >/dev/null \
+              || echo "::warning::Could not update the coverage comment (needs pull-requests: write on the caller)."
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -F body=@comment.md >/dev/null \
+              || echo "::warning::Could not post the coverage comment (needs pull-requests: write on the caller)."
+          fi

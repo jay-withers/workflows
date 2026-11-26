@@ -25,15 +25,22 @@ repos:
         args: ["--allow-multiple-documents"]
 
       - id: end-of-file-fixer
+        # NuGet writes packages.lock.json with no final newline; see
+        # pretty-format-json below.
+        exclude: (^|/)packages\.lock\.json$
 
       - id: pretty-format-json
         args:
           - --autofix
           - --indent=2
         # Exclude non-standard JSON
+        # NuGet writes packages.lock.json its own way (key order, no final
+        # newline) and rewrites it on every restore, which dotnet.yml's
+        # locked check would then report as a change.
         exclude: |
           (?x)^(
               .vscode/tasks.json
+              |(.*/)?packages\.lock\.json
           )$
 
       - id: trailing-whitespace

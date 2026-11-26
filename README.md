@@ -11,6 +11,7 @@ Reusable GitHub Actions workflows, called from other repositories via `workflow_
 | [`pre-commit.yml`](.github/workflows/pre-commit.yml) | Runs all pre-commit hooks against the full repository |
 | [`python.yml`](.github/workflows/python.yml) | Python CI: runs a project's test suite with uv |
 | [`go.yml`](.github/workflows/go.yml) | Go CI: runs a module's test suite, with gofmt, golangci-lint, `go vet`, a tidy check and optional coverage floors |
+| [`dotnet.yml`](.github/workflows/dotnet.yml) | .NET CI: builds a solution with warnings as errors and runs its suite on Microsoft.Testing.Platform, with `dotnet format`, a lock-file check and optional coverage floors |
 | [`docker.yml`](.github/workflows/docker.yml) | Container images: builds one or more images, optionally pushing them under immutable tags |
 | [`release.yml`](.github/workflows/release.yml) | Semver tagging on CD: bumps from conventional commits, pushes the tag, creates a GitHub release |
 | [`codeql.yml`](.github/workflows/codeql.yml) | Code scanning: CodeQL static analysis, one job per language, results in the Security tab |
@@ -27,6 +28,7 @@ What each workflow then needs from `mise.toml`, failing with an error naming the
 | `pre-commit.yml` | `pre-commit`, plus whatever your hooks call: with `terraform: true`, `terraform`, `tflint`, `terraform-docs` and `checkov` | `python-version`, `node-version`, `terraform-version`, `terraform-docs-version`, `checkov-version` |
 | `python.yml` | `uv`, and `python` to choose the interpreter (exported as `UV_PYTHON`; without it uv picks one itself) | `python-version` |
 | `go.yml` (v1.33.0+) | `go`, plus `golangci-lint` while `lint` is on (v1.34.0+), in any mise config from `working-directory` up to the root. There is no fallback: without one the job fails | none |
+| `dotnet.yml` (v1.36.0+) | `dotnet` (the SDK, 10 or later), in any mise config from `working-directory` up to the root. There is no fallback: without one the job fails | none |
 
 `terraform.yml`'s change filter counts `mise.toml` as a Terraform change (v1.26.1+), so a Terraform bump there is validated. `tflint --init` still runs with `terraform: true`, authenticated with the job's token (v1.31.1+), so a hosted runner's shared anonymous GitHub API limit can't fail it. A repo without `mise.toml` sees no change. Renovate's shared `mise` preset keeps the versions current.
 
@@ -495,6 +497,69 @@ Notes:
 | `coverage-pr-comment` | `false` | Post the coverage report as one self-updating PR comment. Needs `coverage` and `pull-requests: write` on the caller |
 | `runs-on` | `ubuntu-latest` | Runner label |
 
+## .NET CI
+
+(v1.36.0+) Builds and tests a .NET solution on the SDK its `mise.toml` pins: a locked restore, `dotnet build` with warnings as errors, `dotnet test` on Microsoft.Testing.Platform, then `dotnet format`. Shaped like [Python CI](#python-ci) and [Go CI](#go-ci) on purpose, so a .NET repo carries the same required check and the same gates.
+
+```yaml
+name: ci-dotnet
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write  # only needed for coverage-pr-comment
+
+jobs:
+  test:
+    uses: jay-withers/workflows/.github/workflows/dotnet.yml@main
+    with:
+      coverage: true
+      coverage-min: "90"
+      diff-coverage: "90"
+```
+
+What the repository needs, all of it in [`tests/dotnet`](tests/dotnet):
+
+- **`mise.toml` pins `dotnet`**, the SDK (`mise use dotnet@<version>`), 10 or later.
+- **`global.json` opts `dotnet test` into Microsoft.Testing.Platform**: `{"test": {"runner": "Microsoft.Testing.Platform"}}`. Leave out an `sdk` block, or keep it equal to the mise pin.
+- **`Directory.Build.props` sets `RestorePackagesWithLockFile`**, and each project's `packages.lock.json` is committed. Setting `EnforceCodeStyleInBuild` and an `AnalysisLevel` there too makes the build's warnings-as-errors the lint gate. Leave `TreatWarningsAsErrors` out and let the `warnings-as-errors` input decide: set in the props, it also fails restore on a new NuGet advisory, and the input can no longer turn the gate off.
+- **Each test project references `Microsoft.Testing.Extensions.CodeCoverage`** when `coverage` is on.
+- **Exclude `packages.lock.json` from the `pretty-format-json` and `end-of-file-fixer` hooks.** NuGet writes it with its own key order and no final newline, and rewrites it on every restore, so a hook that reformats it makes the lock check fail.
+
+Notes:
+
+- **The required status check is `<caller job id> / Test`**, the same as `python.yml`'s and `go.yml`'s, so a repo moving from Python to .NET keeps `test / Test` and its branch protection needs no change.
+- **The SDK comes from `mise.toml` and nowhere else.** There is no `dotnet-version` input and no `setup-dotnet` fallback. mise runs from `working-directory`, and the job fails naming the fix when no config from there up to the root pins `dotnet`. mise's SDK goes first on `PATH`, with `DOTNET_ROOT` pointing at it, ahead of the SDK the runner image has.
+- **Tests run on Microsoft.Testing.Platform only.** It is what `dotnet test` runs from the .NET 10 SDK on, once `global.json` opts in, and what current xunit.v3, MSTest and TUnit releases are built for. On SDK 10+ they refuse the older VSTest mode. The job checks for the opt-in first, looking up from `working-directory` as the SDK does, and fails naming the fix.
+- **`locked` (default on) restores with `--locked-mode`**, the counterpart of `python.yml`'s `locked` and `go.yml`'s `tidy`. NuGet fails when a lock file disagrees with the projects (NU1004), and the job also fails when the restore creates or changes a `packages.lock.json`, or when a tracked `.csproj`, `.fsproj` or `.vbproj` has no committed lock file beside it. The NuGet package cache is keyed on the SDK and every lock file.
+- **`warnings-as-errors` (default on) builds with `-warnaserror`**, so compiler warnings, the analyzers and (with `EnforceCodeStyleInBuild`) code style all fail the job. That is the lint gate: there is no separate linter. NuGet's audit warnings (NU1900-NU1904) are excepted: see the audit note below.
+- **`format` (default on) runs `dotnet format --verify-no-changes`** (whitespace, style and analyzer fixes) after the suite, pass or fail, so one push reports every finding.
+- **`project`** names the `.sln`, `.slnx` or `.csproj` when `working-directory` holds more than one. It is passed to `dotnet test` as `--solution` or `--project`, since the MTP runner takes no positional path.
+- **`coverage: true` measures line coverage** with Microsoft's collector, one Cobertura file per test project, and merges them with a pinned [ReportGenerator](https://reportgenerator.io/) run through `dotnet tool exec`, so nothing is installed. Its summary lands in the job summary, and `coverage-pr-comment: true` posts it as one PR comment kept up to date across pushes. A passing suite that writes no Cobertura file fails naming the missing package.
+- **`coverage-min` is a floor on the merged total line coverage**, checked after a passing suite on every event, so `main` is held to it as well as pull requests. It needs `coverage: true`.
+- **`diff-coverage` gates the pull request's own lines**, exactly as in `python.yml`: the same pinned `diff-cover`, against `HEAD^1`, on `pull_request` after a passing suite, reading the merged Cobertura file. It needs `coverage: true`. Both tool pins are kept current by regex managers in [`renovate.json`](renovate.json).
+- **NuGet's vulnerability audit is not a gate here.** Restore reports advisories as warnings, which the build replays and `-warnnotaserror` keeps as warnings, and a published image is scanned by `docker.yml`'s Trivy gate, which fails a pull request only on a finding with a fix. Failing every PR on a new advisory in any transitive package would block work the PR didn't cause.
+- **Permissions:** `contents: read`, plus `pull-requests: write` for the comment. Without it the comment logs a warning and the suite still passes. The workflow declares no permissions of its own, so set them on the caller.
+
+### .NET inputs
+
+| Input | Default | Description |
+| --- | --- | --- |
+| `working-directory` | `.` | Directory holding the solution or project, with `global.json` at or above it |
+| `project` | `""` | The `.sln`, `.slnx` or `.csproj` to build and test, relative to `working-directory`. Empty lets the SDK find the one there |
+| `configuration` | `Release` | Build configuration |
+| `locked` | `true` | Restore with `--locked-mode`, and fail unless every `packages.lock.json` is committed and unchanged |
+| `warnings-as-errors` | `true` | Build with `-warnaserror` |
+| `format` | `true` | Fail if `dotnet format` would change any file |
+| `coverage` | `false` | Measure line coverage. Reported; gated only by the two inputs below. Needs `Microsoft.Testing.Extensions.CodeCoverage` in each test project |
+| `coverage-min` | `""` | Minimum total line coverage. Empty gates nothing. Needs `coverage` |
+| `diff-coverage` | `""` | Minimum % of the PR's changed lines the suite must run. Empty gates nothing. Needs `coverage` |
+| `coverage-pr-comment` | `false` | Post the coverage report as one self-updating PR comment. Needs `coverage` and `pull-requests: write` on the caller |
+| `runs-on` | `ubuntu-latest` | Runner label |
+
 ## Container images
 
 Builds every image a repository ships, and optionally pushes them. A pull request calls this with `push: false`; the release calls it with `push: true` and the tags to publish. Nothing else differs between the two, which is the point — kept as separate workflows, the PR build and the release build drift on platform, context and cache scope until a green PR proves very little about the release.
@@ -697,7 +762,7 @@ Notes:
 
 This repo dogfoods its own reusable workflows by calling them with local paths (no `@ref` needed). These callers are prefixed `_self_` to distinguish them from the public reusable workflows — they are internal and not meant to be consumed by other repos:
 
-- [`_self_ci.yml`](.github/workflows/_self_ci.yml) calls [`pre-commit.yml`](.github/workflows/pre-commit.yml) on every push and pull request — the hooks in [`.pre-commit-config.yaml`](.pre-commit-config.yaml) cover actionlint, gitleaks secret scanning and file hygiene. It also calls [`go.yml`](.github/workflows/go.yml) against the sample module in [`tests/go`](tests/go) with every gate but the PR comment on (format, lint, and both coverage floors at 90%), so a change to `go.yml` runs before any caller's pin moves. That job is not a required check. The diff-coverage gate only meets real lines on a PR that changes `tests/go/calc`, so touch it when changing how coverage is converted.
+- [`_self_ci.yml`](.github/workflows/_self_ci.yml) calls [`pre-commit.yml`](.github/workflows/pre-commit.yml) on every push and pull request — the hooks in [`.pre-commit-config.yaml`](.pre-commit-config.yaml) cover actionlint, gitleaks secret scanning and file hygiene. It also calls [`go.yml`](.github/workflows/go.yml) against the sample module in [`tests/go`](tests/go) with every gate but the PR comment on (format, lint, and both coverage floors at 90%), so a change to `go.yml` runs before any caller's pin moves. That job is not a required check. The diff-coverage gate only meets real lines on a PR that changes `tests/go/calc`, so touch it when changing how coverage is converted. A `dotnet` job does the same for [`dotnet.yml`](.github/workflows/dotnet.yml) against the sample solution in [`tests/dotnet`](tests/dotnet) (touch `tests/dotnet/src/Calc` when changing how coverage is merged or diffed).
 - [`_self_codeql.yml`](.github/workflows/_self_codeql.yml) calls [`codeql.yml`](.github/workflows/codeql.yml) with `languages: '["actions"]'`, scanning this repo's own workflow files, which are the only code here.
 - [`_self_cd.yml`](.github/workflows/_self_cd.yml) calls [`release.yml`](.github/workflows/release.yml) on pushes to `main` with `update-major-tag: true`, so callers can pin to `@v1`.
 - Every external action is pinned to a full commit SHA with the version in a trailing comment. A pre-commit hook (`pin-github-actions`) enforces this in CI, and Renovate keeps the pins up to date.

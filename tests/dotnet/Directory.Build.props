@@ -1,0 +1,14 @@
+<!--
+  What dotnet.yml's gates expect of a solution: a committed lock file per
+  project (its `locked` check), and analyzers and code style reported by the
+  build, which its `warnings-as-errors` input then fails on. No
+  TreatWarningsAsErrors here: it would fail restore on a new NuGet advisory
+  and leave that input unable to turn the gate off.
+-->
+<Project>
+  <PropertyGroup>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+  </PropertyGroup>
+</Project>
