@@ -26,14 +26,16 @@ is `docs/delivery.md` in `jay-withers/factory`.
   terraform-deploy.yml        OIDC plan, optional apply, drift check, pending/failed issues
   terraform-unlock.yml        manual force-unlock of a stuck state lock
   container-apps-deploy.yml   gate, provenance check, make deploy, make smoke, rollback, Deployments_CL row
-  docker.yml                  build, optional push, Trivy, provenance + SBOM attestations, image Python vs mise.toml
+  docker.yml                  build, optional push, Trivy, provenance + SBOM attestations, image Python and Node vs mise.toml
   pre-commit.yml              pre-commit run --all-files (optional Terraform toolchain)
   python.yml                  uv + pytest, optional ruff lint, coverage floor, diff-coverage gate, type check, Postgres
   go.yml                      Go from mise.toml + go test -race, go vet, gofmt, golangci-lint, tidy check, optional coverage floor and diff-coverage gate
+  node.yml                    Node from mise.toml + npm ci, signature audit, the package's test/typecheck/lint/format:check scripts, optional coverage floor and diff-coverage gate (Cobertura)
   codeql.yml                  CodeQL per language
   release.yml                 semver tag + GitHub release from Conventional Commits
   _self_*.yml                 this repo's own callers (CI, CodeQL, release) - not for other repos
 tests/go/                     the sample module _self_ci.yml runs go.yml against
+tests/node/                   the sample package _self_ci.yml runs node.yml against
 scripts/
   smoke.sh                    the post-deploy smoke test every app's `make smoke` fetches at its pinned SHA
 ```
@@ -95,8 +97,9 @@ the way it is. Read it before changing the workflow, and keep it current.
 
 ## Verifying a change
 
-There is no test suite, apart from `tests/go`, the sample module that
-`_self_ci.yml` runs `go.yml` against on every PR. Before opening a PR:
+There is no test suite, apart from `tests/go` and `tests/node`, the sample
+module and package that `_self_ci.yml` runs `go.yml` and `node.yml` against
+on every PR. Before opening a PR:
 
 - `make pre-commit` runs every hook, including actionlint, shellcheck on the
   inline scripts, and gitleaks. `make lint` runs actionlint alone.

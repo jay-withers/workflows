@@ -1,0 +1,402 @@
+name: Node
+
+# Reusable Node/TypeScript CI: run a package's checks and test suite.
+#
+# The Node counterpart of python.yml and go.yml, and shaped like them on
+# purpose so a Node repo carries the same required check (`<caller job> /
+# Test`, so `test / Test`) and the same gates. It type checks, lints and
+# format-checks as well as testing, so a Node repo's `test / Test` alone says
+# the code is tidy and works.
+#
+# Node, and the npm bundled with it, come from the caller's mise.toml and
+# nowhere else. A setup-node fallback would mean two places pin the version
+# and they would drift; mise is already how every repo here pins its tools,
+# locally and in CI.
+#
+# The checks run the package's own scripts (`typecheck`, `lint`,
+# `format:check`, `test`, `test:coverage`) rather than tools named here.
+# Unlike Go, Node has no one formatter, linter or test runner, and a script is
+# what `make lint` and `make test` call locally, so CI and a laptop run the
+# same command with the versions package-lock.json records.
+#
+# Coverage is read from a Cobertura XML report, which vitest, jest and c8 all
+# write. One format serves both gates: `coverage-min` reads its line totals,
+# and `diff-coverage` hands it to the same pinned diff-cover python.yml and
+# go.yml use, so the three languages count a pull request's lines one way.
+#
+# Like python.yml, deliberately no internal path filter: a Node suite is
+# seconds of runner time, and always running means the required check always
+# reports.
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Directory holding package.json and package-lock.json
+        type: string
+        default: "."
+      ignore-scripts:
+        description: >-
+          Install with `npm ci --ignore-scripts`, so no dependency's install
+          script runs in CI. Turn it off only for a package whose
+          dependencies need one (a native module built at install time)
+        type: boolean
+        default: true
+      typecheck:
+        description: Run the package's `typecheck` script (e.g. `tsc --noEmit`) after the suite
+        type: boolean
+        default: true
+      lint:
+        description: Run the package's `lint` script (e.g. `eslint .`) after the suite
+        type: boolean
+        default: true
+      format:
+        description: Run the package's `format:check` script (e.g. `prettier --check .`) after the suite
+        type: boolean
+        default: true
+      coverage:
+        description: >-
+          Run the package's `test:coverage` script instead of `test`. It must
+          write a Cobertura XML report to `coverage-file`. Reported into the
+          job summary, and gated only by `coverage-min` (the total) and
+          `diff-coverage` (the pull request's own lines)
+        type: boolean
+        default: false
+      coverage-file:
+        description: Path of the Cobertura XML report `test:coverage` writes, relative to working-directory
+        type: string
+        default: coverage/cobertura-coverage.xml
+      coverage-pr-comment:
+        description: >-
+          Post the coverage report as a single PR comment, updated in place on
+          every run. Needs `pull-requests: write` on the caller; without it the
+          comment logs a warning and the suite still passes
+        type: boolean
+        default: false
+      diff-coverage:
+        description: >-
+          Minimum percentage of the lines a pull request changes that the
+          suite must run, e.g. "90". Empty gates nothing. Needs `coverage`.
+          Only the pull request's own lines count, and a pull request that
+          changes no measured code passes
+        type: string
+        default: ""
+      coverage-min:
+        description: >-
+          Minimum total line coverage, e.g. "90". Empty gates nothing. Needs
+          `coverage`. Checked after a passing suite, on every event, so main
+          is held to it as well as pull requests
+        type: string
+        default: ""
+      runs-on:
+        description: Runner label
+        type: string
+        default: ubuntu-latest
+
+jobs:
+  test:
+    # The check name is API: callers' required checks read `<job> / Test`.
+    name: Test
+    runs-on: ${{ inputs.runs-on }}
+    # No `permissions` block, for the same reason as python.yml: a pinned
+    # `contents: read` here would make coverage-pr-comment's
+    # `pull-requests: write` unobtainable whatever the caller grants.
+    steps:
+      # First, so a misconfigured caller hears in seconds.
+      - name: Check inputs
+        env:
+          COVERAGE: ${{ inputs.coverage }}
+          COMMENT: ${{ inputs.coverage-pr-comment }}
+          DIFF_COVERAGE: ${{ inputs.diff-coverage }}
+          COVERAGE_MIN: ${{ inputs.coverage-min }}
+        run: |
+          for name in diff-coverage coverage-min; do
+            if [ "$name" = diff-coverage ]; then value="$DIFF_COVERAGE"; else value="$COVERAGE_MIN"; fi
+            [ -n "$value" ] || continue
+            if [ "$COVERAGE" != "true" ]; then
+              echo "::error::$name needs coverage: true."
+              exit 1
+            fi
+            if ! [[ "$value" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+              echo "::error::$name must be a plain number such as 90, not '$value'."
+              exit 1
+            fi
+          done
+          if [ "$COMMENT" = "true" ] && [ "$COVERAGE" != "true" ]; then
+            echo "::error::coverage-pr-comment needs coverage: true."
+            exit 1
+          fi
+
+      # Depth 2 on a pull request: the merge commit's first parent is the base
+      # branch as merged against, which diff-coverage diffs against.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 1 }}
+
+      # Run from the package's directory: mise reads every config from there
+      # up to the repository root, so a package in a subdirectory can pin its
+      # Node beside it and still inherit the root's tools.
+      - name: Setup mise
+        uses: jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a # v5.2.10
+        with:
+          working_directory: ${{ github.workspace }}/${{ inputs.working-directory }}
+
+      - name: Check Node comes from mise
+        id: node
+        working-directory: ${{ inputs.working-directory }}
+        # `mise which`, not `command -v`: the runner image has a Node of its
+        # own, which would otherwise pass this check and run the suite on a
+        # version nothing pinned. mise's Node (and its npm) then goes first on
+        # PATH, so it is the one every later step runs.
+        run: |
+          if ! node="$(mise which node 2>/dev/null)"; then
+            echo "::error::No mise config from ${PWD#"$GITHUB_WORKSPACE"/} up to the repository root pins node. Add it, e.g. \`mise use node@<version>\`."
+            exit 1
+          fi
+          bindir="$(dirname "$node")"
+          echo "$bindir" >> "$GITHUB_PATH"
+          PATH="$bindir:$PATH"
+          if [ ! -f package-lock.json ]; then
+            echo "::error::No package-lock.json in ${PWD#"$GITHUB_WORKSPACE"/}. Run \`npm install\` and commit it: CI installs exactly what it records, with \`npm ci\`."
+            exit 1
+          fi
+          echo "Node $(node --version), npm $(npm --version)"
+          {
+            echo "version=$(node --version)"
+            echo "cache=$(npm config get cache)"
+          } >> "$GITHUB_OUTPUT"
+
+      # npm's download cache, not node_modules: `npm ci` deletes node_modules
+      # first anyway, and the cache is content-addressed, so a stale entry
+      # costs a download, never a wrong install. Keyed on the Node version and
+      # the lockfile, with a fallback to the newest cache for the same Node.
+      - name: Cache npm downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.node.outputs.cache }}
+          key: npm-${{ runner.os }}-${{ runner.arch }}-${{ steps.node.outputs.version }}-${{ hashFiles(format('{0}/package-lock.json', inputs.working-directory)) }}
+          restore-keys: |
+            npm-${{ runner.os }}-${{ runner.arch }}-${{ steps.node.outputs.version }}-
+
+      # `npm ci`, the counterpart of `uv --locked` and go.yml's tidy check: it
+      # fails when package.json and package-lock.json disagree, rather than
+      # quietly resolving something new. `npm audit signatures` then checks
+      # every installed package against the registry's signatures, so a
+      # tampered download fails here rather than running.
+      - name: Install dependencies
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          IGNORE_SCRIPTS: ${{ inputs.ignore-scripts }}
+        run: |
+          args=()
+          if [ "$IGNORE_SCRIPTS" = "true" ]; then
+            args+=(--ignore-scripts)
+          fi
+          npm ci "${args[@]}"
+          npm audit signatures
+
+      # Every script the job will run must exist before any runs, so a caller
+      # missing one hears which, and how to switch it off, in one go.
+      - name: Check package scripts
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          TYPECHECK: ${{ inputs.typecheck }}
+          LINT: ${{ inputs.lint }}
+          FORMAT: ${{ inputs.format }}
+          COVERAGE: ${{ inputs.coverage }}
+        run: |
+          wanted=()
+          if [ "$COVERAGE" = "true" ]; then wanted+=("test:coverage|coverage: false"); else wanted+=("test|"); fi
+          [ "$TYPECHECK" = "true" ] && wanted+=("typecheck|typecheck: false")
+          [ "$LINT" = "true" ] && wanted+=("lint|lint: false")
+          [ "$FORMAT" = "true" ] && wanted+=("format:check|format: false")
+          missing=0
+          for entry in "${wanted[@]}"; do
+            script="${entry%%|*}"
+            off="${entry#*|}"
+            if ! node -e 'process.exit(require("./package.json").scripts?.[process.argv[1]] ? 0 : 1)' "$script"; then
+              if [ -n "$off" ]; then
+                echo "::error::package.json has no \"$script\" script. Add one, or set $off."
+              else
+                echo "::error::package.json has no \"$script\" script."
+              fi
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Run tests
+        id: suite
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          COVERAGE: ${{ inputs.coverage }}
+        run: |
+          if [ "$COVERAGE" = "true" ]; then
+            npm run test:coverage
+          else
+            npm test
+          fi
+
+      # The three checks run when the suite ran, pass or fail, so one push
+      # reports a failing test, a type error and a lint finding together.
+      - name: Type check
+        if: ${{ !cancelled() && inputs.typecheck && (steps.suite.outcome == 'success' || steps.suite.outcome == 'failure') }}
+        working-directory: ${{ inputs.working-directory }}
+        run: npm run typecheck
+
+      - name: Lint
+        if: ${{ !cancelled() && inputs.lint && (steps.suite.outcome == 'success' || steps.suite.outcome == 'failure') }}
+        working-directory: ${{ inputs.working-directory }}
+        run: npm run lint
+
+      - name: Format
+        if: ${{ !cancelled() && inputs.format && (steps.suite.outcome == 'success' || steps.suite.outcome == 'failure') }}
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          if ! npm run format:check; then
+            echo "::error::format:check failed. If it lists files, run the formatter (e.g. \`prettier --write .\`, or \`make lint\`) and commit the result; otherwise its log above has the cause."
+            exit 1
+          fi
+
+      # Whenever the suite ran, pass or fail, because a failing suite is
+      # exactly when the reader wants to know what the tests reached. Not
+      # after a setup failure, whose cause it would only bury. Guarded on the
+      # report, which a run that failed early never wrote. Line coverage,
+      # from the report's own counts, which is what diff-cover measures too.
+      - name: Report coverage
+        if: ${{ !cancelled() && inputs.coverage && (steps.suite.outcome == 'success' || steps.suite.outcome == 'failure') }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          COVERAGE_FILE: ${{ inputs.coverage-file }}
+        run: |
+          if [ ! -f "$COVERAGE_FILE" ]; then
+            echo "No coverage report at $COVERAGE_FILE — skipping the report." >&2
+            exit 0
+          fi
+          python3 - "$COVERAGE_FILE" > coverage.md <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(sys.argv[1]).getroot()
+
+          def pct(covered, valid):
+              return 100.0 if valid == 0 else 100.0 * covered / valid
+
+          total = pct(int(root.get("lines-covered", 0)), int(root.get("lines-valid", 0)))
+          print(f"**Total: {total:.1f}%** of lines")
+          print()
+          print("<details><summary>Per file</summary>")
+          print()
+          print("| File | Lines | Covered |")
+          print("| --- | ---: | ---: |")
+          for cls in sorted(root.iter("class"), key=lambda c: c.get("filename", "")):
+              lines = cls.findall("lines/line")
+              hit = sum(1 for line in lines if int(line.get("hits", 0)) > 0)
+              print(f"| `{cls.get('filename')}` | {len(lines)} | {pct(hit, len(lines)):.1f}% |")
+          print()
+          print("</details>")
+          PY
+          { echo "## Coverage"; echo; cat coverage.md; } >> "$GITHUB_STEP_SUMMARY"
+
+      # A floor on the total, checked on every event after a passing suite, so
+      # main is held to it as well as pull requests. A failing suite already
+      # fails the job, and its coverage measures nothing.
+      - name: Coverage floor
+        if: ${{ !cancelled() && steps.suite.outcome == 'success' && inputs.coverage-min != '' }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          COVERAGE_FILE: ${{ inputs.coverage-file }}
+          COVERAGE_MIN: ${{ inputs.coverage-min }}
+        run: |
+          if [ ! -f "$COVERAGE_FILE" ]; then
+            echo "::error::test:coverage wrote no Cobertura report at $COVERAGE_FILE. Add a cobertura reporter (vitest: coverage.reporter), or set coverage-file to where it writes."
+            exit 1
+          fi
+          # Compared unrounded, so 89.95% fails a 90% floor; rounded only for
+          # the message.
+          status=0
+          total="$(python3 - "$COVERAGE_FILE" "$COVERAGE_MIN" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(sys.argv[1]).getroot()
+          covered, valid = int(root.get("lines-covered", 0)), int(root.get("lines-valid", 0))
+          total = 100.0 if valid == 0 else 100.0 * covered / valid
+          print(f"{total:.2f}")
+          sys.exit(1 if total < float(sys.argv[2]) else 0)
+          PY
+          )" || status=$?
+          if [ -z "$total" ]; then
+            echo "::error::Could not read line totals from $COVERAGE_FILE."
+            exit 1
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Total coverage is ${total}%, under the ${COVERAGE_MIN}% floor."
+            exit 1
+          fi
+          echo "Total coverage ${total}% meets the ${COVERAGE_MIN}% floor."
+
+      # diff-cover reads the Cobertura report directly: its file paths are
+      # relative to the <source> root, the package directory, which diff-cover
+      # joins to match the paths in `git diff` from the repository root. The
+      # same tool and version as python.yml's and go.yml's, pinned because its
+      # arithmetic decides a required check; renovate.json keeps the pin
+      # current.
+      - name: Setup uv
+        if: ${{ !cancelled() && steps.suite.outcome == 'success' && inputs.diff-coverage != '' && github.event_name == 'pull_request' }}
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+
+      # Compared with HEAD^1, the merge commit's base-branch parent. Only after
+      # a passing suite: a failed test leaves coverage that measures nothing.
+      - name: Diff coverage
+        if: ${{ !cancelled() && steps.suite.outcome == 'success' && inputs.diff-coverage != '' && github.event_name == 'pull_request' }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          COVERAGE_FILE: ${{ inputs.coverage-file }}
+          DIFF_COVERAGE: ${{ inputs.diff-coverage }}
+        run: |
+          if [ ! -f "$COVERAGE_FILE" ]; then
+            echo "::error::test:coverage wrote no Cobertura report at $COVERAGE_FILE. Add a cobertura reporter (vitest: coverage.reporter), or set coverage-file to where it writes."
+            exit 1
+          fi
+          status=0
+          uv tool run diff-cover@11.0.4 "$COVERAGE_FILE" \
+            --compare-branch=HEAD^1 --fail-under="$DIFF_COVERAGE" \
+            --format markdown:diff-coverage.md || status=$?
+          if [ ! -f diff-coverage.md ]; then
+            echo "::error::diff-cover failed before writing a report (exit $status). Its log above has the cause; this is not a coverage result."
+            exit 1
+          fi
+          cat diff-coverage.md >> "$GITHUB_STEP_SUMMARY"
+          { echo; cat diff-coverage.md; } >> coverage.md
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Under $DIFF_COVERAGE% of the lines this pull request changes are run by a test. The summary lists them."
+          fi
+          exit "$status"
+
+      # One comment kept up to date, matched on an HTML marker, exactly as
+      # python.yml and go.yml do, with a marker of its own so a repo using
+      # more than one of them gets one comment from each.
+      - name: Comment coverage on the pull request
+        if: ${{ always() && inputs.coverage && inputs['coverage-pr-comment'] && github.event_name == 'pull_request' }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          [ -f coverage.md ] || exit 0
+          marker='<!-- jay-withers/workflows: node coverage -->'
+          printf '%s\n## Coverage\n\n' "$marker" > comment.md
+          cat coverage.md >> comment.md
+          existing=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            --jq "map(select(.body | startswith(\"$marker\")))[0].id // empty")
+          # Never fatal: a read-only token (a fork, or a caller that did not
+          # grant pull-requests: write) must not fail a suite that passed.
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$existing" -F body=@comment.md >/dev/null \
+              || echo "::warning::Could not update the coverage comment (needs pull-requests: write on the caller)."
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -F body=@comment.md >/dev/null \
+              || echo "::warning::Could not post the coverage comment (needs pull-requests: write on the caller)."
+          fi
