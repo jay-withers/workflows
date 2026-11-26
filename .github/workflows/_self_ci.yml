@@ -40,3 +40,15 @@ jobs:
       coverage: true
       coverage-min: "90"
       diff-coverage: "90"
+
+  # The same self-test for dotnet.yml, against the sample solution in
+  # tests/dotnet, with every gate on but the PR comment. Touch
+  # tests/dotnet/src/Calc when changing how coverage is merged or diffed, so
+  # the diff-coverage gate meets real lines. Not a required check.
+  dotnet:
+    uses: ./.github/workflows/dotnet.yml
+    with:
+      working-directory: tests/dotnet
+      coverage: true
+      coverage-min: "90"
+      diff-coverage: "90"

@@ -1,0 +1,5 @@
+# The .NET SDK that _self_ci.yml's dotnet.yml self-test runs. dotnet.yml takes
+# it from mise.toml and nowhere else, so this solution pins its own; mise
+# merges it with the repository root's tools.
+[tools]
+dotnet = "11.0.100"

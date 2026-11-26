@@ -25,6 +25,9 @@ repos:
         args: ["--allow-multiple-documents"]
 
       - id: end-of-file-fixer
+        # NuGet writes packages.lock.json with no final newline; see
+        # pretty-format-json below.
+        exclude: (^|/)packages\.lock\.json$
 
       - id: pretty-format-json
         args:
@@ -32,11 +35,14 @@ repos:
           - --indent=2
         # Exclude non-standard JSON, and tests/node's, which npm writes
         # (package.json, package-lock.json) and the sample's own Prettier
-        # checks: sorting their keys here would fight both.
+        # checks: sorting their keys here would fight both. NuGet's
+        # packages.lock.json likewise: NuGet rewrites it in its own format on
+        # every restore, which dotnet.yml's locked check would report.
         exclude: |
           (?x)^(
               .vscode/tasks.json
               |tests/node/.*\.json
+              |(.*/)?packages\.lock\.json
           )$
 
       - id: trailing-whitespace
