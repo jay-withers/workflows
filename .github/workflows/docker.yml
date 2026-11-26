@@ -525,13 +525,17 @@ jobs:
 
       # The .NET counterpart, for what dotnet.yml's suite runs on: mise.toml
       # pins the SDK, and a framework-dependent app runs on the image's
-      # runtime, which does not roll forward across a major (or minor). So a
+      # runtime, which by default does not roll forward to a new major. So a
       # dotnet-app release that moved to a new runtime would otherwise pass
       # container-build, auto-merge and fail at startup. Every
       # Microsoft.NETCore.App runtime in the image must match the pin's
-      # major.minor (SDK 11.0.100 is runtime 11.0); an SDK band or patch
-      # changes nothing an app would see. The pin is found as for Node: the
-      # nearest mise config from the context up to the root that pins dotnet.
+      # major.minor (SDK 11.0.100 is runtime 11.0; each .NET release is an X.0
+      # line, so a bare major "11" reads as 11.0); an SDK band or patch
+      # changes nothing an app would see. The SDK pin stands for the app's
+      # TargetFramework: deliberately, since the estate's apps target the SDK
+      # they pin, so an app on an older TFM than its SDK fails here by design.
+      # The pin is found as for Node: the nearest mise.toml or .mise.toml from
+      # the context up to the root that pins dotnet.
       - name: Check ${{ matrix.image.name }}'s .NET runtime matches mise.toml
         if: ${{ !cancelled() && steps.build.outcome == 'success' && !inputs.push && matrix.image.dotnet != '' && !contains(inputs.platforms, ',') }}
         env:
@@ -553,15 +557,19 @@ jobs:
                   path = os.path.join(here, name)
                   if not os.path.isfile(path):
                       continue
-                  tool = tomllib.load(open(path, "rb")).get("tools", {}).get("dotnet")
+                  try:
+                      tool = tomllib.load(open(path, "rb")).get("tools", {}).get("dotnet")
+                  except tomllib.TOMLDecodeError as err:
+                      print(f"{os.path.relpath(path, root)}\tunparsable: {err}")
+                      sys.exit(0)
                   if tool is None:
                       continue
                   if isinstance(tool, list):
                       tool = tool[0] if tool else None
                   if isinstance(tool, dict):
                       tool = tool.get("version")
-                  match = re.match(r"(\d+)\.(\d+)", str(tool or ""))
-                  print(f"{os.path.relpath(path, root)}\t{match[1] + '.' + match[2] if match else ''}")
+                  match = re.match(r"(\d+)(?:\.(\d+))?(?:\.|$)", str(tool or ""))
+                  print(f"{os.path.relpath(path, root)}\t{match[1] + '.' + (match[2] or '0') if match else ''}")
                   sys.exit(0)
               if here == root:
                   break
@@ -574,8 +582,12 @@ jobs:
           fi
           config="${found%%$'\t'*}"
           pinned="${found#*$'\t'}"
+          if [[ "$pinned" == unparsable:* ]]; then
+            echo "::error::$NAME sets dotnet, but $config is not valid TOML: ${pinned#unparsable: }"
+            exit 1
+          fi
           if [ -z "$pinned" ]; then
-            echo "::error::$NAME sets dotnet, but $config pins no dotnet X.Y[.Z] under [tools]."
+            echo "::error::$NAME sets dotnet, but $config pins no dotnet X[.Y[.Z]] under [tools]."
             exit 1
           fi
           listing="$(docker run --rm --entrypoint "$DOTNET_COMMAND" "$LOCAL_REF" --list-runtimes)" || {
@@ -681,14 +693,14 @@ jobs:
           fi
           if [ "$OUTCOME" = "failure" ]; then
             gh label create "$label" -R "$REPOSITORY" --color B60205 \
-              --description "The image no longer builds, passes Trivy, or matches mise.toml's Python or Node on main. Closed by the next success." 2>/dev/null || true
+              --description "The image no longer builds, passes Trivy, or matches mise.toml's Python, Node or .NET on main. Closed by the next success." 2>/dev/null || true
             if [ -n "$existing" ]; then
               gh issue comment "$existing" -R "$REPOSITORY" --body "Failed again: $RUN_URL" > /dev/null
             else
               body="$(printf '%s\n%s\n\n%s\n\n%s\n' "$MARKER" \
-                "@$OWNER The image build on \`$REF\` failed: it no longer builds, Trivy found a fixable CRITICAL/HIGH vulnerability, or its Python or Node no longer matches mise.toml's (the log names which). Every pull request's \`container-build\` check fails the same way until it is fixed, so Renovate's PRs stop merging." \
+                "@$OWNER The image build on \`$REF\` failed: it no longer builds, Trivy found a fixable CRITICAL/HIGH vulnerability, or its Python, Node or .NET runtime no longer matches mise.toml's (the log names which). Every pull request's \`container-build\` check fails the same way until it is fixed, so Renovate's PRs stop merging." \
                 "Run: $RUN_URL" \
-                "Fix it on main (bump the base image or package, accept the risk in \`.trivyignore\`, or move the base image's Python or Node and mise.toml's pin together). This issue closes itself on the next successful build.")"
+                "Fix it on main (bump the base image or package, accept the risk in \`.trivyignore\`, or move the base image's Python, Node or .NET runtime and mise.toml's pin together). This issue closes itself on the next successful build.")"
               gh issue create -R "$REPOSITORY" --title "Image build on $REF failed" --label "$label" --body "$body" > /dev/null
             fi
           elif [ -n "$existing" ]; then
