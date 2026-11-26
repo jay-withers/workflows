@@ -814,7 +814,7 @@ Notes:
 - **The job is green whatever it finds.** Findings are alerts in the Security tab, not a failed check. To block merges on new alerts, turn on code scanning merge protection in the repository's ruleset. That's a per-repository decision, not one this workflow makes.
 - **The status checks are `<caller job id> / Analyze (<language>)`**, one per language: for the example above, `codeql / Analyze (python)` and `codeql / Analyze (actions)`.
 - **`actions` is a language too.** It analyses the repository's own workflow files for injection through `${{ }}` expressions, untrusted checkouts in `pull_request_target`, and over-broad tokens. That's worth including in any repo with workflows, which is every repo here.
-- Only languages that need no build are supported as-is (`python`, `actions`, `javascript-typescript`, `ruby`). A compiled language would need a `build-mode` input.
+- Languages that need no build run with `build-mode: none` (`python`, `actions`, `javascript-typescript`, `ruby`). **`go` runs with `autobuild`**: CodeQL extracts Go from a build. The Go comes from the caller's `mise.toml` (installed by `jdx/mise-action`, first on `PATH`, `GOTOOLCHAIN=local`), the same Go `go.yml` tests with, and the job fails naming the fix when no `go` is pinned. Any other compiled language would need its own mapping.
 
 ### CodeQL inputs
 
