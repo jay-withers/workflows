@@ -19,8 +19,9 @@ on:
       languages:
         description: >-
           JSON array of CodeQL languages to analyse, one job each, e.g.
-          '["python", "actions"]'. Both of those need no build, which is why no
-          build-mode input exists — add one alongside a compiled language
+          '["python", "actions"]' or '["go", "actions"]'. Every language is
+          analysed without a build except `go`, which CodeQL cannot extract
+          without one: it gets `autobuild`, with Go from the caller's mise.toml
         type: string
         default: '["python", "actions"]'
       queries:
@@ -53,11 +54,30 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Go only: CodeQL extracts Go from a build, so it needs a Go, and the
+      # one mise.toml pins (as go.yml uses) rather than whatever the runner
+      # image carries. GOTOOLCHAIN=local stops go.mod's `go` line quietly
+      # downloading another.
+      - name: Setup mise
+        if: matrix.language == 'go'
+        uses: jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a # v5.2.10
+
+      - name: Put mise's Go first on PATH
+        if: matrix.language == 'go'
+        run: |
+          if ! go="$(mise which go 2>/dev/null)"; then
+            echo "::error::Analysing go needs go pinned in mise.toml, e.g. \`mise use go@<version>\`."
+            exit 1
+          fi
+          dirname "$go" >> "$GITHUB_PATH"
+          echo "GOTOOLCHAIN=local" >> "$GITHUB_ENV"
+
       - name: Initialise CodeQL
         uses: github/codeql-action/init@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
         with:
           languages: ${{ matrix.language }}
-          build-mode: none
+          # `none` reads source without building it; Go has no such mode.
+          build-mode: ${{ matrix.language == 'go' && 'autobuild' || 'none' }}
           queries: ${{ inputs.queries }}
 
       # The category keeps each language's results separate in code scanning,
