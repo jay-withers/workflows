@@ -31,6 +31,10 @@ on:
           (v1.36.0+) An optional `node`, the command that runs the image's
           Node (`"node"`), does the same for its major version against the
           `node` pin in the nearest mise config from `context` up to the root.
+          (v1.38.0+) An optional `dotnet`, the command that runs the image's
+          .NET host (`"dotnet"`), checks that every .NET runtime in the image
+          has the major.minor of the `dotnet` SDK pin in the nearest mise
+          config from `context` up to the root.
         required: true
         type: string
       ref:
@@ -258,8 +262,8 @@ jobs:
           # A pull request build is loaded into the local daemon under a
           # local-only tag so Trivy can scan it; a pushed build is scanned
           # from the registry instead. Loading needs a single platform.
-          # The Python and Node checks (below) run the loaded image too.
-          load: ${{ !inputs.push && (inputs.scan || matrix.image.python != '' || matrix.image.node != '') && !contains(inputs.platforms, ',') }}
+          # The Python, Node and .NET checks (below) run the loaded image too.
+          load: ${{ !inputs.push && (inputs.scan || matrix.image.python != '' || matrix.image.node != '' || matrix.image.dotnet != '') && !contains(inputs.platforms, ',') }}
           # The local tag only on a build that does not push: pushed, it would
           # go to Docker Hub.
           tags: |
@@ -519,6 +523,77 @@ jobs:
           fi
           echo "$NAME's image runs Node $image, as $config pins."
 
+      # The .NET counterpart, for what dotnet.yml's suite runs on: mise.toml
+      # pins the SDK, and a framework-dependent app runs on the image's
+      # runtime, which does not roll forward across a major (or minor). So a
+      # dotnet-app release that moved to a new runtime would otherwise pass
+      # container-build, auto-merge and fail at startup. Every
+      # Microsoft.NETCore.App runtime in the image must match the pin's
+      # major.minor (SDK 11.0.100 is runtime 11.0); an SDK band or patch
+      # changes nothing an app would see. The pin is found as for Node: the
+      # nearest mise config from the context up to the root that pins dotnet.
+      - name: Check ${{ matrix.image.name }}'s .NET runtime matches mise.toml
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && !inputs.push && matrix.image.dotnet != '' && !contains(inputs.platforms, ',') }}
+        env:
+          DOTNET_COMMAND: ${{ matrix.image.dotnet }}
+          LOCAL_REF: local-scan/${{ matrix.image.name }}:${{ github.run_id }}
+          NAME: ${{ matrix.image.name }}
+          CONTEXT: ${{ matrix.image.context }}
+        run: |
+          # Prints "<config>\t<major.minor>", "<config>\t" for a pin that is
+          # not a version, or nothing when no config pins dotnet.
+          found="$(python3 - "${CONTEXT:-.}" <<'PY'
+          import os, re, sys, tomllib
+          root = os.path.realpath(".")
+          here = os.path.realpath(sys.argv[1])
+          if os.path.commonpath([root, here]) != root:
+              here = root
+          while True:
+              for name in ("mise.toml", ".mise.toml"):
+                  path = os.path.join(here, name)
+                  if not os.path.isfile(path):
+                      continue
+                  tool = tomllib.load(open(path, "rb")).get("tools", {}).get("dotnet")
+                  if tool is None:
+                      continue
+                  if isinstance(tool, list):
+                      tool = tool[0] if tool else None
+                  if isinstance(tool, dict):
+                      tool = tool.get("version")
+                  match = re.match(r"(\d+)\.(\d+)", str(tool or ""))
+                  print(f"{os.path.relpath(path, root)}\t{match[1] + '.' + match[2] if match else ''}")
+                  sys.exit(0)
+              if here == root:
+                  break
+              here = os.path.dirname(here)
+          PY
+          )"
+          if [ -z "$found" ]; then
+            echo "::error::$NAME sets dotnet, but no mise.toml from its context (${CONTEXT:-.}) up to the repository root pins dotnet."
+            exit 1
+          fi
+          config="${found%%$'\t'*}"
+          pinned="${found#*$'\t'}"
+          if [ -z "$pinned" ]; then
+            echo "::error::$NAME sets dotnet, but $config pins no dotnet X.Y[.Z] under [tools]."
+            exit 1
+          fi
+          listing="$(docker run --rm --entrypoint "$DOTNET_COMMAND" "$LOCAL_REF" --list-runtimes)" || {
+            echo "::error::Could not run '$DOTNET_COMMAND --list-runtimes' in $NAME's image. Set dotnet to the command that starts its .NET host."
+            exit 1
+          }
+          runtimes="$(awk '$1 == "Microsoft.NETCore.App" { split($2, v, "."); print v[1] "." v[2] }' <<<"$listing" | sort -u)"
+          if [ -z "$runtimes" ]; then
+            echo "::error::$NAME's image has no Microsoft.NETCore.App runtime."
+            echo "$listing"
+            exit 1
+          fi
+          if [ "$runtimes" != "$pinned" ]; then
+            echo "::error::$NAME's image runs .NET $(paste -sd, - <<<"$runtimes"), but $config pins the $pinned SDK, which local runs and CI test on. Move them together: the base image's runtime and $config's dotnet."
+            exit 1
+          fi
+          echo "$NAME's image runs .NET $runtimes, as $config pins."
+
       # Not run on a multi-platform build, which is never loaded into the
       # daemon; said so rather than skipped silently.
       - name: Note the skipped Python check
@@ -532,6 +607,12 @@ jobs:
         env:
           NAME: ${{ matrix.image.name }}
         run: echo "::warning::$NAME sets node, but a multi-platform build is not loaded to run it, so its Node was not compared with mise.toml. Build one platform on pull requests to check it."
+
+      - name: Note the skipped .NET check
+        if: ${{ !inputs.push && matrix.image.dotnet != '' && contains(inputs.platforms, ',') }}
+        env:
+          NAME: ${{ matrix.image.name }}
+        run: echo "::warning::$NAME sets dotnet, but a multi-platform build is not loaded to run it, so its .NET runtime was not compared with mise.toml. Build one platform on pull requests to check it."
 
       - name: Refuse fixable ${{ inputs.scan-fail-on }} vulnerabilities
         if: steps.scan.outputs.gate != '' && steps.scan.outputs.gate != '0'

@@ -19,8 +19,10 @@ on:
       languages:
         description: >-
           JSON array of CodeQL languages to analyse, one job each, e.g.
-          '["python", "actions"]'. Both of those need no build, which is why no
-          build-mode input exists — add one alongside a compiled language
+          '["python", "actions"]'. Every language runs with build-mode none:
+          those two need no build, and csharp (and java-kotlin) analyse from
+          source without one. Add a build-mode input alongside a language
+          that cannot (c-cpp, go, swift)
         type: string
         default: '["python", "actions"]'
       queries:
